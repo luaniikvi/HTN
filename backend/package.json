@@ -1,0 +1,22 @@
+{
+  "name": "doorlock-backend",
+  "version": "1.0.0",
+  "description": "Backend MVC for ESP32 Security Doorlock System",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "node src/app.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mqtt": "^5.10.3",
+    "mysql2": "^3.12.0",
+    "node-cron": "^3.0.3",
+    "sequelize": "^6.37.5",
+    "ws": "^8.18.0"
+  }
+}

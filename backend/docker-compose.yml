@@ -1,0 +1,64 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: doorlock_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_secure_password
+      MYSQL_DATABASE: doorlock_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_secure_password"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: doorlock_mosquitto
+    restart: unless-stopped
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+
+  backend:
+    build: .
+    container_name: doorlock_backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "3443:3443"
+    environment:
+      PORT_HTTP: 3000
+      PORT_HTTPS: 3443
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: root_secure_password
+      DB_NAME: doorlock_db
+      MQTT_BROKER_URL: mqtt://mosquitto:1883
+      MQTT_USER: esp32_client
+      MQTT_PASS: esp32_pass_secure
+      DEVICE_ID: dev_01
+      JWT_SECRET: super_secret_jwt_key_esp32_security_2026
+      JWT_EXPIRES_IN: 7d
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+
+volumes:
+  mysql_data:
+  mosquitto_data:
+  mosquitto_log:
