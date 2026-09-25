@@ -1,53 +1,75 @@
 <template>
   <div v-if="alert" class="modal-backdrop">
-    <div class="glass-card breach-modal pulsing-alarm">
+    <div ref="breachModalRef" class="clean-card breach-modal pulsing-alarm">
+      <!-- Header -->
       <div class="breach-header">
-        <div class="alert-icon-wrapper">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="alert-icon">
-            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
-            <line x1="12" y1="9" x2="12" y2="13"></line>
-            <line x1="12" y1="17" x2="12.01" y2="17"></line>
-          </svg>
+        <div class="alert-icon-box">
+          <AlertOctagon :size="28" class="alert-svg" />
         </div>
-        <div>
-          <span class="badge badge-armed">CẢNH BÁO ĐỘT NHẬP THỜI GIAN THỰC</span>
-          <h2>PHÁT HIỆN VI PHẠM MỞ CỬA!</h2>
+        <div class="breach-header-text">
+          <span class="badge badge-armed">REAL-TIME INTRUSION ALERT</span>
+          <h2 class="breach-title">Unauthorized Door Breach!</h2>
         </div>
       </div>
 
+      <!-- Body -->
       <div class="breach-body">
         <p class="breach-desc">
-          Cảm biến cửa MC-38 đã phát hiện <strong>CỬA BỊ MỞ</strong> khi hệ thống đang ở chế độ bảo vệ
+          The MC-38 magnetic contact sensor detected a <strong>DOOR OPEN</strong> event while the system was secured in
           <span class="badge" :class="alert.mode === 'ARMED' ? 'badge-armed' : 'badge-stay'">{{ alert.mode }}</span>
-          mà chưa được xác thực khuôn mặt hợp lệ!
+          mode without valid Face ID biometric verification!
         </p>
 
-        <div class="breach-info font-mono">
-          <div><span>Thiết bị:</span> <strong>{{ alert.deviceId || 'dev_01' }}</strong></div>
-          <div><span>Thời điểm:</span> <strong>{{ formatTime(alert.timestamp) }}</strong></div>
-          <div>
-            <span>Trạng thái còi:</span>
+        <div class="breach-telemetry font-mono">
+          <div class="telemetry-row">
+            <span>Device ID:</span>
+            <strong>{{ alert.deviceId || 'dev_01' }}</strong>
+          </div>
+          <div class="telemetry-row">
+            <span>Timestamp:</span>
+            <strong>{{ formatTime(alert.timestamp) }}</strong>
+          </div>
+          <div class="telemetry-row">
+            <span>Buzzer Status:</span>
             <strong :class="alert.mode === 'ARMED' ? 'text-danger' : 'text-warning'">
-              {{ alert.mode === 'ARMED' ? 'BUZZER_ON (Đang hú công suất tối đa)' : 'BUZZER_BEEP (Báo động tại chỗ - beep ~2s)' }}
+              {{ alert.mode === 'ARMED' ? 'BUZZER_ON (Continuous High-Output Siren)' : 'BUZZER_BEEP (Local Perimeter Reminder)' }}
             </strong>
           </div>
         </div>
+
+        <!-- Snapshot Capture Preview -->
+        <div v-if="alert.imageUrl" class="snapshot-container">
+          <div class="snapshot-header">
+            <span class="snapshot-label">📸 CAPTURED BREACH EVIDENCE (SVGA COLOR)</span>
+            <a :href="alert.imageUrl" target="_blank" class="full-link">
+              Open Full Size ↗
+            </a>
+          </div>
+          <div class="snapshot-frame">
+            <img :src="alert.imageUrl" alt="Intrusion Snapshot" class="snapshot-img" />
+          </div>
+        </div>
+
+        <div v-else-if="alert.mode === 'ARMED'" class="snapshot-waiting font-mono">
+          <span class="pulse-dot"></span>
+          <span>Camera capturing and uploading evidence snapshot...</span>
+        </div>
       </div>
 
+      <!-- Actions -->
       <div class="breach-actions">
-        <!-- Nút chuyển DISARMED -->
         <button class="btn btn-primary" @click="handleDisarm" :disabled="isProcessing">
-          CHUYỂN SANG DISARMED (MỞ CỬA TỰ DO)
+          <ShieldOff :size="16" />
+          <span>Switch to DISARMED (Open Freely)</span>
         </button>
 
-        <!-- Nút ngắt còi -->
         <button class="btn btn-danger" @click="handleSilenceAlarm" :disabled="isProcessing">
-          TẮT CÒI BÁO ĐỘNG (SILENCE ALARM)
+          <BellOff :size="16" />
+          <span>Silence Siren Only</span>
         </button>
 
-        <!-- Nút đóng -->
-        <button class="btn btn-secondary" @click="system.dismissBreachAlert">
-          Đóng thông báo
+        <button class="btn btn-secondary btn-sm" @click="system.dismissBreachAlert">
+          Dismiss Notice
         </button>
       </div>
     </div>
@@ -55,19 +77,36 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue';
+import { computed, ref, onMounted, watch } from 'vue';
 import { useSystemStore } from '../stores/system';
+import gsap from 'gsap';
+import {
+  AlertOctagon,
+  ShieldOff,
+  BellOff
+} from 'lucide-vue-next';
 
 const system = useSystemStore();
 const alert = computed(() => system.activeBreachAlert);
 const isProcessing = ref(false);
+const breachModalRef = ref(null);
+
+watch(alert, (newVal) => {
+  if (newVal && breachModalRef.value) {
+    gsap.fromTo(
+      breachModalRef.value,
+      { scale: 0.9, opacity: 0 },
+      { scale: 1, opacity: 1, duration: 0.3, ease: 'back.out(1.5)' }
+    );
+  }
+});
 
 async function handleDisarm() {
   isProcessing.value = true;
   try {
     await system.changeMode('DISARMED');
   } catch (err) {
-    alert('Lỗi: ' + err.message);
+    alert('Error: ' + err.message);
   } finally {
     isProcessing.value = false;
   }
@@ -78,24 +117,35 @@ async function handleSilenceAlarm() {
   try {
     await system.toggleAlarm(false);
   } catch (err) {
-    alert('Lỗi: ' + err.message);
+    alert('Error: ' + err.message);
   } finally {
     isProcessing.value = false;
   }
 }
 
 function formatTime(iso) {
-  if (!iso) return 'Vừa xong';
-  return new Date(iso).toLocaleTimeString('vi-VN');
+  if (!iso) return 'Just now';
+  return new Date(iso).toLocaleTimeString('en-US');
 }
+
+onMounted(() => {
+  if (alert.value && breachModalRef.value) {
+    gsap.fromTo(
+      breachModalRef.value,
+      { scale: 0.9, opacity: 0 },
+      { scale: 1, opacity: 1, duration: 0.3, ease: 'back.out(1.5)' }
+    );
+  }
+});
 </script>
 
 <style scoped>
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.85);
-  backdrop-filter: blur(10px);
+  background: rgba(15, 23, 42, 0.75);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -106,42 +156,39 @@ function formatTime(iso) {
 .breach-modal {
   width: 100%;
   max-width: 540px;
-  background: #181116;
-  border: 2px solid #ef4444;
-  border-radius: 14px;
+  background: #ffffff;
+  border: 2px solid var(--color-armed);
+  border-radius: var(--radius-lg);
   padding: 24px;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 18px;
+  box-shadow: 0 20px 35px -5px rgba(239, 68, 68, 0.3);
 }
 
 .breach-header {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
 }
 
-.alert-icon-wrapper {
+.alert-icon-box {
   width: 48px;
   height: 48px;
-  border-radius: 50%;
-  background: rgba(239, 68, 68, 0.2);
+  border-radius: var(--radius-md);
+  background: var(--color-armed-subtle);
+  color: var(--color-armed);
   display: flex;
   align-items: center;
   justify-content: center;
+  border: 1px solid var(--color-armed-border);
 }
 
-.alert-icon {
-  width: 28px;
-  height: 28px;
-  color: #ef4444;
-}
-
-.breach-header h2 {
+.breach-title {
   font-size: 1.25rem;
   font-weight: 800;
-  color: #ef4444;
-  margin-top: 4px;
+  color: var(--color-armed-text);
+  margin-top: 2px;
 }
 
 .breach-body {
@@ -151,33 +198,113 @@ function formatTime(iso) {
 }
 
 .breach-desc {
-  font-size: 0.95rem;
-  line-height: 1.6;
-  color: #e5e7eb;
+  font-size: 0.875rem;
+  line-height: 1.55;
+  color: var(--text-main);
 }
 
-.breach-info {
-  background: rgba(0, 0, 0, 0.4);
-  padding: 12px 16px;
-  border-radius: 8px;
-  border: 1px solid rgba(239, 68, 68, 0.3);
-  font-size: 0.85rem;
+.breach-telemetry {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  font-size: 0.78rem;
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.text-danger {
-  color: #f87171;
+.telemetry-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 
-.text-warning {
-  color: #fbbf24;
+.text-danger { color: var(--color-armed); }
+.text-warning { color: var(--color-stay); }
+
+/* Snapshot Preview */
+.snapshot-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #0f172a;
+  border-radius: var(--radius-md);
+  padding: 10px;
+}
+
+.snapshot-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.snapshot-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #f87171;
+  letter-spacing: 0.04em;
+}
+
+.full-link {
+  font-size: 0.72rem;
+  color: #60a5fa;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.full-link:hover {
+  text-decoration: underline;
+}
+
+.snapshot-frame {
+  width: 100%;
+  max-height: 240px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+.snapshot-img {
+  width: 100%;
+  height: auto;
+  max-height: 240px;
+  object-fit: contain;
+}
+
+.snapshot-waiting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--color-armed-subtle);
+  border: 1px dashed var(--color-armed-border);
+  border-radius: var(--radius-md);
+  font-size: 0.78rem;
+  color: var(--color-armed-text);
+}
+
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-armed);
+  animation: pulse-dot-anim 1.2s infinite;
+}
+
+@keyframes pulse-dot-anim {
+  0% { transform: scale(0.9); opacity: 0.6; }
+  50% { transform: scale(1.3); opacity: 1; }
+  100% { transform: scale(0.9); opacity: 0.6; }
 }
 
 .breach-actions {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
+  margin-top: 4px;
 }
 </style>

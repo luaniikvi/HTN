@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const https = require('https');
+const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 
 const { sequelize } = require('./models');
@@ -9,6 +11,12 @@ const { getSslCredentials } = require('./config/ssl');
 const mqttGateway = require('./services/mqttGateway.service');
 const videoStreamService = require('./services/videoStream.service');
 const cronEngineService = require('./services/cronEngine.service');
+
+// Tự động khởi tạo thư mục lưu ảnh chụp vi phạm
+const breachUploadDir = path.join(__dirname, '../uploads/breach_images');
+if (!fs.existsSync(breachUploadDir)) {
+  fs.mkdirSync(breachUploadDir, { recursive: true });
+}
 
 // Import routes
 const authRoutes = require('./routes/auth.routes');
@@ -22,6 +30,9 @@ const app = express();
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Phục vụ tệp tĩnh ảnh vi phạm an ninh
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // RESTful API Routing
 app.use('/api/auth', authRoutes);
@@ -60,7 +71,7 @@ async function startServer() {
     // Kết nối CSDL
     await sequelize.authenticate();
     console.log('✅ Database connected successfully');
-    await sequelize.sync(); // Đồng bộ bảng dữ liệu
+    await sequelize.sync({ alter: true }); // Đồng bộ bảng dữ liệu và cập nhật schema mới
 
     // Tự động khởi tạo và đảm bảo tài khoản admin / admin123
     const bcrypt = require('bcryptjs');

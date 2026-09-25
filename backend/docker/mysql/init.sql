@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS alarm_logs (
   mode ENUM('ARMED', 'STAY', 'DISARMED') NOT NULL,
   event VARCHAR(64) NOT NULL,
   details TEXT NULL,
+  image_url VARCHAR(255) NULL,
   resolved_at DATETIME NULL,
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_timestamp (timestamp)

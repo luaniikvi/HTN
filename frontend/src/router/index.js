@@ -1,7 +1,12 @@
 import { createRouter, createWebHistory } from 'vue-router';
 import LoginView from '../views/LoginView.vue';
 import RegisterView from '../views/RegisterView.vue';
-import DashboardView from '../views/DashboardView.vue';
+import AppLayout from '../components/layout/AppLayout.vue';
+import LiveMonitorView from '../views/LiveMonitorView.vue';
+import SecurityView from '../views/SecurityView.vue';
+import FacesView from '../views/FacesView.vue';
+import LogsView from '../views/LogsView.vue';
+import SettingsView from '../views/SettingsView.vue';
 
 const routes = [
   {
@@ -16,9 +21,39 @@ const routes = [
   },
   {
     path: '/',
-    name: 'Dashboard',
-    component: DashboardView,
-    meta: { requiresAuth: true }
+    component: AppLayout,
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        redirect: '/security'
+      },
+      {
+        path: 'security',
+        name: 'Security',
+        component: SecurityView
+      },
+      {
+        path: 'monitor',
+        name: 'LiveMonitor',
+        component: LiveMonitorView
+      },
+      {
+        path: 'faces',
+        name: 'Faces',
+        component: FacesView
+      },
+      {
+        path: 'logs',
+        name: 'Logs',
+        component: LogsView
+      },
+      {
+        path: 'settings',
+        name: 'Settings',
+        component: SettingsView
+      }
+    ]
   }
 ];
 
@@ -32,7 +67,7 @@ router.beforeEach((to, from, next) => {
   if (to.meta.requiresAuth && !token) {
     next('/login');
   } else if ((to.path === '/login' || to.path === '/register') && token) {
-    next('/');
+    next('/security');
   } else {
     next();
   }

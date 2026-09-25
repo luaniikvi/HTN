@@ -129,6 +129,17 @@ class VideoStreamService {
       });
     });
   }
+
+  broadcastEvent(type, payload) {
+    if (this.eventsWss && this.eventsWss.clients) {
+      const msg = JSON.stringify({ type, payload });
+      for (const client of this.eventsWss.clients) {
+        if (client.readyState === 1) { // 1 = OPEN
+          client.send(msg);
+        }
+      }
+    }
+  }
 }
 
 const videoStreamService = new VideoStreamService();

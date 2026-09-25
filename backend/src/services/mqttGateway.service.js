@@ -113,12 +113,28 @@ class MqttGateway extends EventEmitter {
         const event = payload.event || 'BREACH';
         const mode = payload.mode || 'ARMED';
 
-        await AlarmLog.create({
-          device_id: deviceId,
-          mode: mode,
-          event: event,
-          details: `Security breach detected! Door opened without valid face auth in ${mode} mode.`
+        // Kiểm tra xem đã có bản ghi cảnh báo nào vừa được tạo trong vòng 8 giây gần đây chưa (tránh duplicate với HTTP upload)
+        const recentAlarm = await AlarmLog.findOne({
+          where: { device_id: deviceId, event: event },
+          order: [['id', 'DESC']]
         });
+
+        let isRecent = false;
+        if (recentAlarm && recentAlarm.timestamp) {
+          const diffMs = Math.abs(Date.now() - new Date(recentAlarm.timestamp).getTime());
+          if (diffMs < 8000 || Math.abs(diffMs - 7 * 3600 * 1000) < 8000) {
+            isRecent = true;
+          }
+        }
+
+        if (!isRecent) {
+          await AlarmLog.create({
+            device_id: deviceId,
+            mode: mode,
+            event: event,
+            details: `Phát hiện vi phạm đột nhập mở cửa khi chưa xác thực ở chế độ ${mode}.`
+          });
+        }
 
         await SystemState.update(
           { armed_latched: mode === 'ARMED', last_heartbeat: new Date() },

@@ -27,6 +27,10 @@ const AlarmLog = sequelize.define('AlarmLog', {
     type: DataTypes.DATE,
     allowNull: true
   },
+  image_url: {
+    type: DataTypes.STRING(255),
+    allowNull: true
+  },
   timestamp: {
     type: DataTypes.DATE,
     defaultValue: DataTypes.NOW

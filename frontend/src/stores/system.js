@@ -121,7 +121,10 @@ export const useSystemStore = defineStore('system', {
               this.activeBreachAlert = null;
             }
           } else if (type === 'ALARM_BREACH') {
-            this.activeBreachAlert = payload;
+            this.activeBreachAlert = {
+              ...(this.activeBreachAlert || {}),
+              ...payload
+            };
             this.armedLatched = true;
           } else if (type === 'ENROLL_STEP') {
             this.enrollStep = payload.step;

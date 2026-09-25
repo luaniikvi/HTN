@@ -1,0 +1,3 @@
+model:
+  name: "qwen2.5-coder:7b-instruct"
+  context_length: 64000
