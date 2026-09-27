@@ -171,7 +171,10 @@ function onPageEnter(el, done) {
     y: 0,
     duration: 0.25,
     ease: 'power2.out',
-    onComplete: done
+    onComplete: () => {
+      gsap.set(el, { clearProps: 'transform' });
+      done();
+    }
   });
 }
 

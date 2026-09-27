@@ -79,6 +79,7 @@
 <script setup>
 import { computed, ref, onMounted, watch } from 'vue';
 import { useSystemStore } from '../stores/system';
+import { useNotifyStore } from '../stores/notify';
 import gsap from 'gsap';
 import {
   AlertOctagon,
@@ -87,6 +88,7 @@ import {
 } from 'lucide-vue-next';
 
 const system = useSystemStore();
+const notify = useNotifyStore();
 const alert = computed(() => system.activeBreachAlert);
 const isProcessing = ref(false);
 const breachModalRef = ref(null);
@@ -105,8 +107,9 @@ async function handleDisarm() {
   isProcessing.value = true;
   try {
     await system.changeMode('DISARMED');
+    notify.success('System disarmed successfully.', 'Disarmed');
   } catch (err) {
-    alert('Error: ' + err.message);
+    notify.error('Failed to disarm system: ' + err.message);
   } finally {
     isProcessing.value = false;
   }
@@ -116,8 +119,9 @@ async function handleSilenceAlarm() {
   isProcessing.value = true;
   try {
     await system.toggleAlarm(false);
+    notify.info('Siren silenced.', 'Siren Inactive');
   } catch (err) {
-    alert('Error: ' + err.message);
+    notify.error('Failed to silence siren: ' + err.message);
   } finally {
     isProcessing.value = false;
   }

@@ -13,11 +13,18 @@
           class="btn btn-lg"
           :class="isStreamingActive ? 'btn-danger' : 'btn-primary'"
           @click="toggleStreaming"
+          :disabled="!isDeviceReady"
         >
           <MorphIcon :icon="streamButtonIcon" :size="20" spring="snappy" />
           <span>{{ isStreamingActive ? 'Stop Stream' : 'Start Live Stream' }}</span>
         </button>
       </div>
+    </div>
+
+    <!-- Offline Warning Strip -->
+    <div v-if="!isDeviceReady" class="offline-banner">
+      <AlertTriangle :size="18" />
+      <span>ESP32 camera is currently <strong>OFFLINE</strong>. Real-time video stream is unavailable until device reconnects.</span>
     </div>
 
     <!-- Main Stream Layout Grid -->
@@ -68,7 +75,7 @@
             <p class="standby-desc">
               Streaming runs on-demand to conserve MCU Core 1 computation and preserve Wi-Fi bandwidth for edge face recognition.
             </p>
-            <button class="btn btn-primary btn-md" @click="startStream">
+            <button class="btn btn-primary btn-md" @click="startStream" :disabled="!isDeviceReady">
               <Play :size="18" />
               <span>Launch Live View</span>
             </button>
@@ -91,12 +98,19 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import api from '../api/client';
+import { useSystemStore } from '../stores/system';
+import { useNotifyStore } from '../stores/notify';
 import { MorphIcon } from 'morphicons/vue';
 import { Play as LucidePlay, Square as LucideSquare } from 'lucide';
 import {
   Camera,
-  Play
+  Play,
+  AlertTriangle
 } from 'lucide-vue-next';
+
+const system = useSystemStore();
+const notify = useNotifyStore();
+const isDeviceReady = computed(() => system.isOnline);
 
 const isStreamingActive = ref(false);
 const currentFrameUrl = ref(null);
@@ -130,6 +144,10 @@ function scheduleRender() {
 }
 
 function startStream() {
+  if (!isDeviceReady.value) {
+    notify.warning('ESP32 device is OFFLINE. Cannot launch camera stream.', 'Camera Offline');
+    return;
+  }
   if (isStreamingActive.value) return;
   isStreamingActive.value = true;
   wsStatusText.value = 'Requesting camera activation from ESP32-S3...';

@@ -7,6 +7,10 @@ router.get('/', verifyToken, faceController.getFaces);
 router.post('/enroll', verifyToken, faceController.startEnroll);
 router.post('/cancel-enroll', verifyToken, faceController.cancelEnroll);
 router.post('/bind', verifyToken, faceController.bindFace);
+router.patch('/:id/toggle', verifyToken, faceController.toggleFaceActive);
+router.put('/:id/toggle', verifyToken, faceController.toggleFaceActive);
+router.delete('/', verifyToken, faceController.deleteAllFaces);
+router.delete('/all', verifyToken, faceController.deleteAllFaces);
 router.delete('/:id', verifyToken, faceController.deleteFace);
 
 module.exports = router;

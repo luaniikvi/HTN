@@ -155,6 +155,7 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
 import { useSystemStore } from '../stores/system';
+import { useNotifyStore } from '../stores/notify';
 import api from '../api/client';
 import gsap from 'gsap';
 import {
@@ -169,6 +170,7 @@ import {
 
 const emit = defineEmits(['close', 'face-saved']);
 const system = useSystemStore();
+const notify = useNotifyStore();
 
 const modalCardRef = ref(null);
 const isStarting = ref(false);
@@ -195,8 +197,9 @@ async function startEnrollment() {
   try {
     await api.post('/faces/enroll');
     system.enrollStep = 1;
+    notify.info('Face enrollment initiated on ESP32-S3 camera.', 'Sensor Ready');
   } catch (err) {
-    alert('Failed to initiate enrollment: ' + (err.response?.data?.message || err.message));
+    notify.error('Failed to initiate enrollment: ' + (err.response?.data?.message || err.message));
   } finally {
     isStarting.value = false;
   }
@@ -216,9 +219,16 @@ async function cancelEnrollment() {
   }
 }
 
-function handleClose() {
+async function handleClose() {
   if (currentStep.value >= 1 && currentStep.value <= 3) {
-    if (confirm('Cancel ongoing face enrollment on the hardware device?')) {
+    const confirmed = await notify.confirm({
+      title: 'Cancel Enrollment',
+      message: 'Cancel ongoing face enrollment on the hardware device?',
+      confirmText: 'Cancel Enrollment',
+      cancelText: 'Continue',
+      type: 'warning'
+    });
+    if (confirmed) {
       cancelEnrollment();
     }
   } else {
@@ -240,13 +250,13 @@ async function saveFaceMetadata() {
     });
 
     isCompleted.value = true;
-    alert('Face ID profile successfully bound and saved!');
+    notify.success('Face ID profile successfully bound and saved!', 'Profile Saved');
     system.enrollStep = 0;
     system.enrolledFaceId = null;
     emit('face-saved');
     emit('close');
   } catch (err) {
-    alert('Save error: ' + (err.response?.data?.message || err.message));
+    notify.error('Save error: ' + (err.response?.data?.message || err.message));
   } finally {
     isSaving.value = false;
   }

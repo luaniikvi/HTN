@@ -65,8 +65,8 @@ exports.bindFace = async (req, res) => {
   }
 };
 
-// Gửi lệnh xóa khuôn mặt khỏi Flash NVS trên MCU
-exports.deleteFace = async (req, res) => {
+// Bật/tắt trạng thái hoạt động (Active / Inactive) của khuôn mặt
+exports.toggleFaceActive = async (req, res) => {
   try {
     const faceId = parseInt(req.params.id);
     if (isNaN(faceId)) {
@@ -78,14 +78,66 @@ exports.deleteFace = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Face not found in database' });
     }
 
+    face.is_active = typeof req.body.is_active === 'boolean' ? req.body.is_active : !face.is_active;
+    await face.save();
+
+    res.json({
+      success: true,
+      message: `Face #${faceId} is now ${face.is_active ? 'ACTIVE' : 'INACTIVE'}`,
+      face
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// Xóa vĩnh viễn khuôn mặt khỏi Database và gửi lệnh xóa tới MCU
+exports.deleteFace = async (req, res) => {
+  try {
+    if (req.params.id === 'all' || req.params.id === '-1') {
+      return exports.deleteAllFaces(req, res);
+    }
+
+    const faceId = parseInt(req.params.id);
+    if (isNaN(faceId)) {
+      return res.status(400).json({ success: false, message: 'Invalid face_id' });
+    }
+
+    const face = await Face.findOne({ where: { face_id: faceId } });
+    if (!face) {
+      return res.status(404).json({ success: false, message: 'Face not found in database' });
+    }
+
+    // Xóa luôn khỏi database
+    await face.destroy();
+
     // Phát lệnh xóa xuống ESP32
     console.log(`Sending MQTT command to delete face ${faceId} on ESP32...`);
     mqttGateway.sendDeleteCommand(faceId);
 
-    // Trả về thông báo đang chờ xử lý ACK từ ESP32
     res.json({
       success: true,
-      message: `Delete request for face ${faceId} dispatched to MCU. Database will be updated upon ACK.`
+      message: `Face #${faceId} permanently deleted from database and MCU.`
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// Xóa tất cả khuôn mặt trong Database và trên Flash MCU
+exports.deleteAllFaces = async (req, res) => {
+  try {
+    // Xóa toàn bộ trong database
+    const deletedCount = await Face.destroy({ where: {}, truncate: true });
+
+    // Phát lệnh xóa tất cả xuống ESP32
+    console.log('Sending MQTT command to delete ALL faces on ESP32...');
+    mqttGateway.sendDeleteAllCommand();
+
+    res.json({
+      success: true,
+      message: 'All faces permanently deleted from database and MCU.',
+      deletedCount
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

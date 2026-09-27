@@ -11,6 +11,7 @@ const { getSslCredentials } = require('./config/ssl');
 const mqttGateway = require('./services/mqttGateway.service');
 const videoStreamService = require('./services/videoStream.service');
 const cronEngineService = require('./services/cronEngine.service');
+const discoveryService = require('./services/discovery.service');
 
 // Tự động khởi tạo thư mục lưu ảnh chụp vi phạm
 const breachUploadDir = path.join(__dirname, '../uploads/breach_images');
@@ -107,6 +108,9 @@ async function startServer() {
 
     // Khởi động Cron Engine quét mặt tạm thời hết hạn
     cronEngineService.start();
+
+    // Khởi động UDP Discovery Service cho ESP32 tự tìm Server IP
+    discoveryService.start(PORT_HTTP);
 
     // Lắng nghe cổng HTTP (3000)
     httpServer.listen(PORT_HTTP, '0.0.0.0', () => {

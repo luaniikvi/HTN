@@ -126,8 +126,10 @@
 <script setup>
 import { ref, computed } from 'vue';
 import { useSystemStore } from '../stores/system';
+import { useNotifyStore } from '../stores/notify';
 
 const system = useSystemStore();
+const notify = useNotifyStore();
 const isSubmitting = ref(false);
 const graceInput = ref(system.gracePeriod || 10);
 
@@ -142,40 +144,58 @@ const isAlarmActive = computed(() => {
 });
 
 async function selectMode(mode) {
+  if (!system.isOnline) {
+    notify.warning('Device is OFFLINE. Cannot change security mode.', 'Hardware Offline');
+    return;
+  }
   if (system.securityMode === mode) return;
   isSubmitting.value = true;
   try {
     await system.changeMode(mode);
+    notify.success(`Security mode changed to ${mode}.`, 'Mode Updated');
   } catch (err) {
-    alert('Không thể đổi chế độ: ' + (err.response?.data?.message || err.message));
+    notify.error('Failed to change mode: ' + (err.response?.data?.message || err.message));
   } finally {
     isSubmitting.value = false;
   }
 }
 
 async function handleToggleAlarm() {
+  if (!system.isOnline) {
+    notify.warning('Device is OFFLINE. Cannot toggle alarm.', 'Hardware Offline');
+    return;
+  }
   isSubmitting.value = true;
   try {
     const nextState = !isAlarmActive.value;
     await system.toggleAlarm(nextState);
+    if (nextState) {
+      notify.warning('Emergency panic siren triggered.', 'Siren Activated');
+    } else {
+      notify.info('Siren silenced.', 'Siren Inactive');
+    }
   } catch (err) {
-    alert('Thao tác còi thất bại: ' + (err.response?.data?.message || err.message));
+    notify.error('Failed to toggle siren: ' + (err.response?.data?.message || err.message));
   } finally {
     isSubmitting.value = false;
   }
 }
 
 async function saveGracePeriod() {
+  if (!system.isOnline) {
+    notify.warning('Device is OFFLINE. Cannot update settings.', 'Hardware Offline');
+    return;
+  }
   if (graceInput.value < 3 || graceInput.value > 60) {
-    alert('Thời gian ân hạn phải từ 3 đến 60 giây');
+    notify.warning('Grace period must be between 3 and 60 seconds.', 'Invalid Input');
     return;
   }
   isSubmitting.value = true;
   try {
     await system.updateGracePeriod(graceInput.value);
-    alert('Đã cập nhật thời gian ân hạn mở cửa thành công!');
+    notify.success(`Grace timeout updated to ${graceInput.value}s.`, 'Settings Saved');
   } catch (err) {
-    alert('Lỗi cập nhật: ' + err.message);
+    notify.error('Failed to update grace period: ' + err.message);
   } finally {
     isSubmitting.value = false;
   }

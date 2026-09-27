@@ -161,7 +161,11 @@ class MqttGateway extends EventEmitter {
         const status = payload.status;
 
         if (status === 'SUCCESS') {
-          await Face.update({ is_active: false }, { where: { face_id: faceId } });
+          if (faceId === -1) {
+            await Face.destroy({ where: {}, truncate: true });
+          } else {
+            await Face.destroy({ where: { face_id: faceId } });
+          }
         }
 
         this.emit('deleted_done', { deviceId, faceId, status });
@@ -195,6 +199,10 @@ class MqttGateway extends EventEmitter {
 
   sendDeleteCommand(faceId, deviceId = this.deviceId) {
     return this.publishCommand(`device/${deviceId}/cmd/delete_face`, { cmd: 'DELETE', face_id: faceId });
+  }
+
+  sendDeleteAllCommand(deviceId = this.deviceId) {
+    return this.publishCommand(`device/${deviceId}/cmd/delete_face`, { cmd: 'DELETE', all: true, face_id: -1 });
   }
 
   sendAlarmCommand(alarmState, deviceId = this.deviceId) {

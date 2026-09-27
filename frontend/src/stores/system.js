@@ -22,6 +22,11 @@ export const useSystemStore = defineStore('system', {
     isEnrolling: false
   }),
 
+  getters: {
+    isOnline: (state) => state.status === 'ONLINE' && state.wsConnected,
+    isDeviceOnline: (state) => state.status === 'ONLINE'
+  },
+
   actions: {
     async fetchSystemState() {
       try {

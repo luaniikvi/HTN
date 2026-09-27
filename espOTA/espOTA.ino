@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <WebSocketsClient.h>
@@ -50,18 +51,16 @@
 // =================================================================================================
 // 2. THÔNG SỐ MẠNG & MQTT TOPIC HIERARCHY
 // =================================================================================================
-const char* serverIP      = "192.168.1.188"; 
+char        serverIP[16]  = "192.168.1.188"; // IP mặc định (Fallback nếu discovery timeout)
 
 const char* ssid          = "Nguyen Loi";
 const char* password      = "123456NL";
 
-const char* mqtt_server   = serverIP; // Địa chỉ IP máy chạy Docker Mosquitto
 const int   mqtt_port     = 1883;
 const char* mqtt_user     = "esp32_client";
 const char* mqtt_pass     = "esp32_pass_secure";
 
-const char* ws_host       = serverIP; // Địa chỉ IP máy chạy Backend Service
-const int   ws_port       = 3000;
+int         ws_port       = 3000;
 const char* ws_path       = "/ws/camera/stream";
 
 const char* DEVICE_ID     = "dev_01";
@@ -827,13 +826,25 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       xSemaphoreGive(sharedStateMutex);
     }
   }
-  // Lệnh xóa khuôn mặt khỏi Flash MCU
+  // Lệnh xóa khuôn mặt khỏi Flash MCU (xóa 1 mặt hoặc xóa toàn bộ)
   else if (strcmp(topic, topic_cmd_delete) == 0) {
-    int faceId = doc["face_id"];
-    bool deleted = deleteFaceFromNVS(faceId);
-    deleteDoneFaceId = faceId;
-    deleteDoneResult = deleted;
-    deleteDoneEventPending = true; // Gửi sự kiện an toàn ngoài loop()
+    if ((doc.containsKey("all") && doc["all"] == true) || (doc.containsKey("face_id") && doc["face_id"] == -1)) {
+      Preferences p;
+      p.begin(PREF_NAMESPACE, false);
+      p.clear();
+      p.end();
+      deleteDoneFaceId = -1;
+      deleteDoneResult = true;
+      deleteDoneEventPending = true;
+      Serial.println("[NVS] 🗑️ ĐÃ XÓA TOÀN BỘ KHUÔN MẶT KHỎI FLASH NVS!");
+    } else {
+      int faceId = doc["face_id"];
+      bool deleted = deleteFaceFromNVS(faceId);
+      deleteDoneFaceId = faceId;
+      deleteDoneResult = deleted;
+      deleteDoneEventPending = true; // Gửi sự kiện an toàn ngoài loop()
+      Serial.printf("[NVS] 🗑️ Đã xóa face #%d (Kết quả: %s)\n", faceId, deleted ? "OK" : "NOT_FOUND");
+    }
   }
   // Lệnh bật/tắt còi cưỡng bức khẩn cấp hoặc tắt còi trực tiếp từ Web
   else if (strcmp(topic, topic_cmd_alarm) == 0) {
@@ -888,6 +899,29 @@ void tryReconnectMQTT() {
   }
 }
 
+// ponytail: UDP discovery via stdlib WiFiUDP, parse with strstr/sscanf, zero extra deps
+void discoverServerIP(uint32_t timeoutMs = 15000) {
+  WiFiUDP udp;
+  if (!udp.begin(8888)) return;
+  char buf[128];
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (udp.parsePacket() > 0) {
+      int n = udp.read(buf, sizeof(buf) - 1);
+      buf[n > 0 ? n : 0] = '\0';
+      if (strstr(buf, "\"service\":\"esp32_security_backend\"")) {
+        snprintf(serverIP, sizeof(serverIP), "%s", udp.remoteIP().toString().c_str());
+        char* p = strstr(buf, "\"port\":");
+        if (p) sscanf(p + 7, "%d", &ws_port);
+        Serial.printf("[NET] 🎯 Discovered server: %s:%d\n", serverIP, ws_port);
+        break;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  udp.stop(); // ponytail: drop socket immediately to free lwIP PCB
+}
+
 // =================================================================================================
 // 9. SETUP & LOOP (CORE 0: NETWORKING, I/O & AN TOÀN NGOẠI TUYẾN)
 // =================================================================================================
@@ -931,8 +965,6 @@ void setup() {
   snprintf(topic_cmd_alarm, sizeof(topic_cmd_alarm), "device/%s/cmd/alarm", DEVICE_ID);
   snprintf(topic_cmd_stream, sizeof(topic_cmd_stream), "device/%s/cmd/stream", DEVICE_ID);
   snprintf(topic_cmd_config, sizeof(topic_cmd_config), "device/%s/cmd/config", DEVICE_ID);
-  snprintf(breach_upload_url, sizeof(breach_upload_url), "http://%s:%d/api/logs/breach-capture", serverIP, ws_port);
-
   // Đọc chế độ an ninh khởi tạo từ công tắc vật lý
   currentMode = readSwitchModeWithDebounce();
 
@@ -956,17 +988,20 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[NET] ✅ Đã kết nối Wi-Fi thành công! IP: %s\n", WiFi.localIP().toString().c_str());
+    discoverServerIP(15000);
   } else {
     Serial.println("[NET] ⚠️ Không kết nối được Wi-Fi trong 5s. Tiếp tục chạy chế độ ngoại tuyến.");
   }
 
-  mqttClient.setServer(mqtt_server, mqtt_port);
+  snprintf(breach_upload_url, sizeof(breach_upload_url), "http://%s:%d/api/logs/breach-capture", serverIP, ws_port);
+
+  mqttClient.setServer(serverIP, mqtt_port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(512);
   mqttClient.setKeepAlive(30);
   mqttClient.setSocketTimeout(2);
 
-  webSocket.begin(ws_host, ws_port, ws_path);
+  webSocket.begin(serverIP, ws_port, ws_path);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(3000);
 

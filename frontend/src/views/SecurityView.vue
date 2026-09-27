@@ -17,6 +17,12 @@
       </div>
     </div>
 
+    <!-- Offline Warning Banner -->
+    <div v-if="!isDeviceReady" class="offline-banner">
+      <AlertTriangle :size="18" />
+      <span>ESP32 device is currently <strong>OFFLINE</strong>. Security mode, siren trigger, and grace period controls are locked.</span>
+    </div>
+
     <!-- Security Mode Cards Grid (3 Core Modes) -->
     <div class="section-container">
       <h3 class="section-title">Active Protection Mode</h3>
@@ -24,7 +30,7 @@
         <!-- 1. DISARMED -->
         <div
           class="clean-card mode-card disarmed-card"
-          :class="{ active: system.securityMode === 'DISARMED', disabled: isSubmitting }"
+          :class="{ active: system.securityMode === 'DISARMED', disabled: isSubmitting || !isDeviceReady }"
           @click="selectMode('DISARMED')"
         >
           <div class="card-radio-mark">
@@ -47,7 +53,7 @@
         <!-- 2. STAY -->
         <div
           class="clean-card mode-card stay-card"
-          :class="{ active: system.securityMode === 'STAY', disabled: isSubmitting }"
+          :class="{ active: system.securityMode === 'STAY', disabled: isSubmitting || !isDeviceReady }"
           @click="selectMode('STAY')"
         >
           <div class="card-radio-mark">
@@ -70,7 +76,7 @@
         <!-- 3. ARMED -->
         <div
           class="clean-card mode-card armed-card"
-          :class="{ active: system.securityMode === 'ARMED', disabled: isSubmitting }"
+          :class="{ active: system.securityMode === 'ARMED', disabled: isSubmitting || !isDeviceReady }"
           @click="selectMode('ARMED')"
         >
           <div class="card-radio-mark">
@@ -117,7 +123,7 @@
           class="btn siren-trigger-btn"
           :class="isAlarmActive ? 'btn-danger pulsing-alarm' : 'btn-secondary'"
           @click="handleToggleAlarm"
-          :disabled="isSubmitting"
+          :disabled="isSubmitting || !isDeviceReady"
         >
           <MorphIcon :icon="isAlarmActive ? LucideBellRing : LucideBell" :size="18" spring="snappy" />
           <span>{{ isAlarmActive ? 'Silence Active Siren' : 'Trigger Panic Siren' }}</span>
@@ -148,6 +154,7 @@
               class="btn btn-secondary btn-xs preset-btn"
               :class="{ selected: graceInput === preset }"
               @click="graceInput = preset"
+              :disabled="isSubmitting || !isDeviceReady"
             >
               {{ preset }}s
             </button>
@@ -160,9 +167,10 @@
               max="60"
               v-model.number="graceInput"
               class="input-control grace-input font-mono"
+              :disabled="isSubmitting || !isDeviceReady"
             />
             <span class="input-unit">seconds</span>
-            <button class="btn btn-primary btn-sm" @click="saveGracePeriod" :disabled="isSubmitting">
+            <button class="btn btn-primary btn-sm" @click="saveGracePeriod" :disabled="isSubmitting || !isDeviceReady">
               Save
             </button>
           </div>
@@ -181,6 +189,7 @@
 <script setup>
 import { ref, computed } from 'vue';
 import { useSystemStore } from '../stores/system';
+import { useNotifyStore } from '../stores/notify';
 import { MorphIcon } from 'morphicons/vue';
 import {
   ShieldCheck,
@@ -191,10 +200,13 @@ import {
 } from 'lucide';
 import {
   Bell,
-  Clock
+  Clock,
+  AlertTriangle
 } from 'lucide-vue-next';
 
 const system = useSystemStore();
+const notify = useNotifyStore();
+const isDeviceReady = computed(() => system.isOnline);
 const isSubmitting = ref(false);
 const graceInput = ref(system.gracePeriod || 10);
 const saveMessage = ref('');
@@ -208,43 +220,62 @@ const isAlarmActive = computed(() => {
 });
 
 async function selectMode(mode) {
+  if (!isDeviceReady.value) {
+    notify.warning('Device is OFFLINE. Cannot change security mode.', 'Hardware Offline');
+    return;
+  }
   if (system.securityMode === mode) return;
   isSubmitting.value = true;
   try {
     await system.changeMode(mode);
+    notify.success(`Security mode changed to ${mode}.`, 'Mode Updated');
   } catch (err) {
-    alert('Failed to change security mode: ' + (err.response?.data?.message || err.message));
+    notify.error('Failed to change security mode: ' + (err.response?.data?.message || err.message));
   } finally {
     isSubmitting.value = false;
   }
 }
 
 async function handleToggleAlarm() {
+  if (!isDeviceReady.value) {
+    notify.warning('Device is OFFLINE. Cannot toggle alarm.', 'Hardware Offline');
+    return;
+  }
   isSubmitting.value = true;
   try {
     const nextState = !isAlarmActive.value;
     await system.toggleAlarm(nextState);
+    if (nextState) {
+      notify.warning('Emergency panic siren triggered.', 'Siren Activated');
+    } else {
+      notify.info('Siren silenced.', 'Siren Inactive');
+    }
   } catch (err) {
-    alert('Failed to toggle alarm: ' + (err.response?.data?.message || err.message));
+    notify.error('Failed to toggle alarm: ' + (err.response?.data?.message || err.message));
   } finally {
     isSubmitting.value = false;
   }
 }
 
 async function saveGracePeriod() {
+  if (!isDeviceReady.value) {
+    notify.warning('Device is OFFLINE. Cannot update settings.', 'Hardware Offline');
+    return;
+  }
   if (graceInput.value < 3 || graceInput.value > 60) {
-    alert('Grace period must be between 3 and 60 seconds.');
+    notify.warning('Grace period must be between 3 and 60 seconds.', 'Invalid Input');
     return;
   }
   isSubmitting.value = true;
   try {
     await system.updateGracePeriod(graceInput.value);
+    notify.success(`Door breach grace timeout set to ${graceInput.value}s.`, 'Settings Saved');
     saveMessage.value = '✓ Grace timeout successfully updated';
     setTimeout(() => {
       saveMessage.value = '';
     }, 3000);
   } catch (err) {
-    alert('Failed to update grace period: ' + err.message);
+    notify.error('Failed to update grace period: ' + err.message);
   } finally {
     isSubmitting.value = false;
   }
