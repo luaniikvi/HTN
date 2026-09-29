@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <WebSocketsClient.h>
@@ -51,19 +50,18 @@
 // =================================================================================================
 // 2. THÔNG SỐ MẠNG & MQTT TOPIC HIERARCHY
 // =================================================================================================
-char        serverIP[16]  = "";  // IP mặc định (Fallback nếu discovery timeout)
+const char* serverIP      = "192.168.1.188"; 
 
-// const char* ssid          = "Nhat Phat Tokyo";
-// const char* password      = "16666666";
+const char* ssid          = "Nguyen Loi";
+const char* password      = "123456NL";
 
-const char* ssid          = "Fee Wi-MESH";
-const char* password      = "cma.khoa";
-
+const char* mqtt_server   = serverIP; // Địa chỉ IP máy chạy Docker Mosquitto
 const int   mqtt_port     = 1883;
 const char* mqtt_user     = "esp32_client";
 const char* mqtt_pass     = "esp32_pass_secure";
 
-int         ws_port       = 3000;
+const char* ws_host       = serverIP; // Địa chỉ IP máy chạy Backend Service
+const int   ws_port       = 3000;
 const char* ws_path       = "/ws/camera/stream";
 
 const char* DEVICE_ID     = "dev_01";
@@ -235,7 +233,7 @@ void IRAM_ATTR onDoorInterrupt() {
   static int64_t lastInterruptTime = 0;
   int64_t now = esp_timer_get_time() / 1000ULL; // IRAM-safe timer
   if (now - lastInterruptTime > 50) { // Lọc rung >= 50ms
-    isDoorOpen = false;//(digitalRead(DOOR_PIN) == HIGH); // Hở mạch = Cửa mở
+    isDoorOpen = (digitalRead(DOOR_PIN) == HIGH); // Hở mạch = Cửa mở
     doorStateChanged = true;
     lastInterruptTime = now;
   }
@@ -319,20 +317,23 @@ bool initCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_QVGA; // Khởi tạo trực tiếp QVGA để DMA tối ưu tốc độ và không lãng phí RAM
+  config.frame_size   = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode    = CAMERA_GRAB_LATEST; // Luôn lấy frame mới nhất, triệt tiêu lag/delay stream
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12; // Cân bằng hoàn hảo giữa độ nét và băng thông (~9KB/frame, cực mượt)
-  config.fb_count     = 2;  // Double buffering chống giật
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
 
-  // Cấu hình PSRAM chuẩn
+  // Cấu hình PSRAM chuẩn 100% theo CameraWebServer
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count     = 2;
+      config.grab_mode    = CAMERA_GRAB_LATEST;
       Serial.printf("-> PSRAM OK: Total %u B, Free %u B\n", (unsigned int)ESP.getPsramSize(), (unsigned int)ESP.getFreePsram());
     } else {
+      config.frame_size   = FRAMESIZE_SVGA;
       config.fb_location  = CAMERA_FB_IN_DRAM;
-      config.fb_count     = 1;
       Serial.println("-> CẢNH BÁO: Không có PSRAM!");
     }
   }
@@ -454,25 +455,23 @@ bool detectFaceInFrame(camera_fb_t *fb) {
   int skinPixels = 0;
   int minX = 320, maxX = 0, minY = 240, maxY = 0;
   long sumX = 0, sumY = 0;
-  int minLum = 255, maxLum = 0;
 
-  // Bước nhảy STEP = 5: quét ~2200 điểm mẫu (nhanh, mượt, không nghẽn stream)
-  const int STEP = 5;
-  for (int y = 20; y < 220; y += STEP) {
-    for (int x = 25; x < 295; x += STEP) {
+  // Quét lưới ma trận trung tâm với bước nhảy STEP = 4 (quét ~3500 điểm mẫu trong < 2ms)
+  const int STEP = 4;
+  for (int y = 16; y < 224; y += STEP) {
+    for (int x = 24; x < 296; x += STEP) {
       int idx = (y * 320 + x) * 3;
       int r = rgb_buf[idx];
       int g = rgb_buf[idx + 1];
       int b = rgb_buf[idx + 2];
 
-      // Dùng phép dịch bit >> 10 (~ /1024) siêu tốc
-      int cb = ((-173 * r - 339 * g + 512 * b) >> 10) + 128;
-      int cr = (( 512 * r - 429 * g -  83 * b) >> 10) + 128;
+      // Chuyển đổi sang không gian màu YCbCr
+      int cb = (-169 * r - 331 * g + 500 * b) / 1000 + 128;
+      int cr = ( 500 * r - 419 * g -  81 * b) / 1000 + 128;
 
-      // Phân đoạn dải màu da người chuẩn (Loại bỏ triệt để tường vàng, trần nhà và đồ gỗ)
-      // cr >= 133: Sắc tố đỏ mao mạch da người (tường/trần nhà chỉ đạt cr <= 130)
-      if (cb >= 77 && cb <= 130 && cr >= 133 && cr <= 175) {
-        if (r > 60 && g > 40 && b > 20 && r > g && (r - g) >= 10 && (r - b) >= 14) {
+      // Phân đoạn dải màu da người (Human Face Skin Chrominance Bounds)
+      if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173) {
+        if (r > 60 && g > 40 && b > 20 && r > g && (r - g) >= 12) {
           skinPixels++;
           sumX += x;
           sumY += y;
@@ -480,53 +479,43 @@ bool detectFaceInFrame(camera_fb_t *fb) {
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
           if (y > maxY) maxY = y;
-
-          int lum = (r * 77 + g * 150 + b * 29) >> 8;
-          if (lum < minLum) minLum = lum;
-          if (lum > maxLum) maxLum = lum;
         }
       }
     }
   }
 
-  // 1. Số lượng điểm da: Tối thiểu 90 điểm (đủ kích thước khuôn mặt thực), tối đa 1600 điểm
-  if (skinPixels < 90 || skinPixels > 1600) {
-    return false;
+  // 1. Kiểm tra diện tích vùng da mặt: Phải đủ kích thước khuôn mặt thực tế
+  if (skinPixels < 100 || skinPixels > 1600) {
+    return false; // Quá ít (không có người) hoặc quá nhiều (bị che kín / chói lóa)
   }
 
   int boxW = maxX - minX;
   int boxH = maxY - minY;
 
-  // 2. Kích thước bounding box chuẩn khuôn mặt (tối thiểu 38x45 pixel ở cự ly 30cm - 1.2m)
-  if (boxW < 38 || boxH < 45) {
+  // 2. Kích thước bounding box tối thiểu ở cự ly mở cửa (30cm - 1.2m)
+  if (boxW < 40 || boxH < 48) {
     return false;
   }
 
-  // 3. Tỉ lệ khung hình học khuôn mặt người (Chiều cao / Chiều rộng: 0.80 -> 1.90)
+  // 3. Tỉ lệ khung hình học khuôn mặt người (Chiều cao / Chiều rộng: 0.85 -> 2.0)
   float aspect = (float)boxH / (float)boxW;
-  if (aspect < 0.80f || aspect > 1.90f) {
+  if (aspect < 0.85f || aspect > 2.0f) {
     return false;
   }
 
-  // 4. Mật độ phân bố vùng da (loại bỏ mặt phẳng đồng màu như mảng tường)
+  // 4. Mật độ phân bố vùng da bên trong khung
   int totalSampledInBox = (boxW / STEP) * (boxH / STEP);
   if (totalSampledInBox > 0) {
     float density = (float)skinPixels / (float)totalSampledInBox;
-    if (density < 0.22f || density > 0.88f) {
+    if (density < 0.25f || density > 0.90f) {
       return false;
     }
   }
 
-  // 5. Kiểm tra độ tương phản ngũ quan (mắt, mày, mũi có độ chênh lệch sáng tối so với da)
-  // Mảng tường phẳng luôn có độ tương phản rất thấp (maxLum - minLum < 30)
-  if ((maxLum - minLum) < 32) {
-    return false;
-  }
-
-  // 6. Tọa độ tâm khuôn mặt phải nằm trong góc nhìn hợp lệ của camera
+  // 5. Tọa độ tâm khuôn mặt phải nằm trong góc nhìn hợp lệ của camera
   int centerX = sumX / skinPixels;
   int centerY = sumY / skinPixels;
-  if (centerX < 45 || centerX > 275 || centerY < 30 || centerY > 210) {
+  if (centerX < 50 || centerX > 270 || centerY < 35 || centerY > 205) {
     return false;
   }
 
@@ -548,8 +537,8 @@ void aiCameraTask(void *pvParameters) {
   Serial.println("🚀 [CORE 1] AI Camera Task đã khởi động!");
 
   while (true) {
-    // 1. Luôn duy trì WebSocket loop ngay đầu vòng lặp khi đã có serverIP
-    if (WiFi.status() == WL_CONNECTED && strlen(serverIP) > 0) {
+    // 1. Luôn duy trì WebSocket loop ngay đầu vòng lặp để không bị timeout/ngắt kết nối
+    if (WiFi.status() == WL_CONNECTED) {
       webSocket.loop();
     }
 
@@ -658,15 +647,15 @@ void aiCameraTask(void *pvParameters) {
     bool needScanFace   = (localMode == MODE_ARMED || localMode == MODE_STAY) && !localEnrolling && !localAuth && authCooldownOk;
 
     if (needScanFace || localStreaming) {
-      bool timeForScan   = needScanFace && (millis() - lastFaceScanTime >= 400); // Quét khuôn mặt mỗi 400ms (giảm tải CPU)
-      bool timeForStream = localStreaming && (millis() - lastWsFrameTime >= 50);  // Stream mượt ~20 FPS
+      bool timeForScan   = needScanFace && (millis() - lastFaceScanTime >= 350); // Quét khuôn mặt mỗi 350ms
+      bool timeForStream = localStreaming && (millis() - lastWsFrameTime >= 65);  // Stream ~15 FPS
 
       if (timeForScan || timeForStream) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb != NULL) {
           frameCount++;
 
-          // 4.1. Đẩy frame qua WebSocket nếu đang bật Stream (ưu tiên gửi ngay để video cực mượt)
+          // 4.1. Đẩy frame qua WebSocket nếu đang bật Stream
           if (localStreaming && timeForStream) {
             lastWsFrameTime = millis();
             if (WiFi.status() == WL_CONNECTED && webSocket.isConnected() && fb->len > 0) {
@@ -682,8 +671,8 @@ void aiCameraTask(void *pvParameters) {
               bool hasFace = detectFaceInFrame(fb);
               if (hasFace) {
                 consecutiveFaceHits++;
-                Serial.printf("[AI-CORE1] 👤 Phát hiện khuôn mặt trong khung hình (%d/2 frame)...\n", consecutiveFaceHits);
-                // Xác thực chắc chắn qua 2 frame liên tiếp (hoặc gần kề) để mở cửa
+                Serial.printf("[AI-CORE1] 👤 Phát hiện khuôn mặt trong khung hình (Khớp %d/2 frame)...\n", consecutiveFaceHits);
+                // Xác thực chắc chắn qua 2 frame liên tiếp để chống nhận diện nhầm
                 if (consecutiveFaceHits >= 2) {
                   consecutiveFaceHits = 0;
                   lastAuthTriggerMillis = millis(); // Ghi nhận mốc kích hoạt để bắt đầu thời gian ân hạn
@@ -692,7 +681,7 @@ void aiCameraTask(void *pvParameters) {
                   Serial.printf("[AI-CORE1] 🟢 XÁC THỰC KHUÔN MẶT THÀNH CÔNG (NVS: %d hồ sơ)! Cho phép mở cửa.\n", enrolledCount);
                 }
               } else {
-                consecutiveFaceHits = 0; // Chống nhận diện nhầm khi không có khuôn mặt
+                consecutiveFaceHits = 0;
               }
             } else if (enrolledCount == 0 && (millis() - lastDebugPrint >= 5000)) {
               Serial.println("[AI-CORE1] ℹ️ Chưa có khuôn mặt nào trong Flash NVS. Hãy bấm 'Đăng ký khuôn mặt' trên Web.");
@@ -712,11 +701,11 @@ void aiCameraTask(void *pvParameters) {
           esp_camera_fb_return(fb);
         }
       }
-      vTaskDelay(pdMS_TO_TICKS(2)); // Nhường nhẹ CPU 2ms thay vì 15ms để stream đạt 20 FPS mượt mà
+      vTaskDelay(pdMS_TO_TICKS(15));
     } else {
       consecutiveFaceHits = 0;
-      // Khi ở chế độ DISARMED hoặc đang trong thời gian ân hạn: Nghỉ 50ms để tiết kiệm CPU
-      vTaskDelay(pdMS_TO_TICKS(50));
+      // Khi ở chế độ DISARMED hoặc đang trong thời gian ân hạn: Nghỉ 100ms để tiết kiệm CPU
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
   }
 }
@@ -838,25 +827,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       xSemaphoreGive(sharedStateMutex);
     }
   }
-  // Lệnh xóa khuôn mặt khỏi Flash MCU (xóa 1 mặt hoặc xóa toàn bộ)
+  // Lệnh xóa khuôn mặt khỏi Flash MCU
   else if (strcmp(topic, topic_cmd_delete) == 0) {
-    if ((doc.containsKey("all") && doc["all"] == true) || (doc.containsKey("face_id") && doc["face_id"] == -1)) {
-      Preferences p;
-      p.begin(PREF_NAMESPACE, false);
-      p.clear();
-      p.end();
-      deleteDoneFaceId = -1;
-      deleteDoneResult = true;
-      deleteDoneEventPending = true;
-      Serial.println("[NVS] 🗑️ ĐÃ XÓA TOÀN BỘ KHUÔN MẶT KHỎI FLASH NVS!");
-    } else {
-      int faceId = doc["face_id"];
-      bool deleted = deleteFaceFromNVS(faceId);
-      deleteDoneFaceId = faceId;
-      deleteDoneResult = deleted;
-      deleteDoneEventPending = true; // Gửi sự kiện an toàn ngoài loop()
-      Serial.printf("[NVS] 🗑️ Đã xóa face #%d (Kết quả: %s)\n", faceId, deleted ? "OK" : "NOT_FOUND");
-    }
+    int faceId = doc["face_id"];
+    bool deleted = deleteFaceFromNVS(faceId);
+    deleteDoneFaceId = faceId;
+    deleteDoneResult = deleted;
+    deleteDoneEventPending = true; // Gửi sự kiện an toàn ngoài loop()
   }
   // Lệnh bật/tắt còi cưỡng bức khẩn cấp hoặc tắt còi trực tiếp từ Web
   else if (strcmp(topic, topic_cmd_alarm) == 0) {
@@ -911,63 +888,6 @@ void tryReconnectMQTT() {
   }
 }
 
-// ponytail: UDP discovery with auto-retry in loop, both active ping and passive listen
-bool discoverServerIP(uint32_t timeoutMs = 4000) {
-  if (strlen(serverIP) > 0) return true;
-  WiFiUDP udp;
-  if (!udp.begin(8888)) {
-    Serial.println("[NET] ❌ Không thể mở UDP port 8888!");
-    return false;
-  }
-  Serial.printf("[NET] 🔍 Đang tìm kiếm Server qua UDP port 8888 (chờ %ds)...\n", timeoutMs / 1000);
-
-  // Gửi gói tin chủ động hỏi Server (cả 255.255.255.255 và Directed Subnet Broadcast)
-  udp.beginPacket("255.255.255.255", 8888);
-  udp.print("{\"cmd\":\"DISCOVER_SERVER\"}");
-  udp.endPacket();
-
-  IPAddress bcast = ~WiFi.subnetMask() | WiFi.localIP();
-  udp.beginPacket(bcast, 8888);
-  udp.print("{\"cmd\":\"DISCOVER_SERVER\"}");
-  udp.endPacket();
-
-  char buf[128];
-  uint32_t t0 = millis();
-  while (millis() - t0 < timeoutMs) {
-    if (udp.parsePacket() > 0) {
-      int n = udp.read(buf, sizeof(buf) - 1);
-      buf[n > 0 ? n : 0] = '\0';
-      if (strstr(buf, "\"service\":\"esp32_security_backend\"")) {
-        snprintf(serverIP, sizeof(serverIP), "%s", udp.remoteIP().toString().c_str());
-        char* p = strstr(buf, "\"port\":");
-        if (p) sscanf(p + 7, "%d", &ws_port);
-        Serial.printf("[NET] 🎯 Discovered server: %s:%d\n", serverIP, ws_port);
-        udp.stop();
-        return true;
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  udp.stop(); // ponytail: drop socket immediately to free lwIP PCB
-  return false;
-}
-
-void initNetworkClients() {
-  if (strlen(serverIP) == 0) return;
-  snprintf(breach_upload_url, sizeof(breach_upload_url), "http://%s:%d/api/logs/breach-capture", serverIP, ws_port);
-
-  mqttClient.setServer(serverIP, mqtt_port);
-  mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(512);
-  mqttClient.setKeepAlive(30);
-  mqttClient.setSocketTimeout(2);
-
-  webSocket.begin(serverIP, ws_port, ws_path);
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(3000);
-  Serial.printf("[NET] 🌐 Khởi tạo kết nối tới Server: %s (WS:%d, MQTT:%d)\n", serverIP, ws_port, mqtt_port);
-}
-
 // =================================================================================================
 // 9. SETUP & LOOP (CORE 0: NETWORKING, I/O & AN TOÀN NGOẠI TUYẾN)
 // =================================================================================================
@@ -991,7 +911,7 @@ void setup() {
   pinMode(SW_PIN_2, INPUT_PULLUP);
 
   pinMode(DOOR_PIN, INPUT_PULLUP);
-  isDoorOpen = false;//(digitalRead(DOOR_PIN) == HIGH);
+  isDoorOpen = (digitalRead(DOOR_PIN) == HIGH);
   attachInterrupt(digitalPinToInterrupt(DOOR_PIN), onDoorInterrupt, CHANGE);
 
   pinMode(LED_R_PIN, OUTPUT); digitalWrite(LED_R_PIN, LOW);
@@ -1011,6 +931,8 @@ void setup() {
   snprintf(topic_cmd_alarm, sizeof(topic_cmd_alarm), "device/%s/cmd/alarm", DEVICE_ID);
   snprintf(topic_cmd_stream, sizeof(topic_cmd_stream), "device/%s/cmd/stream", DEVICE_ID);
   snprintf(topic_cmd_config, sizeof(topic_cmd_config), "device/%s/cmd/config", DEVICE_ID);
+  snprintf(breach_upload_url, sizeof(breach_upload_url), "http://%s:%d/api/logs/breach-capture", serverIP, ws_port);
+
   // Đọc chế độ an ninh khởi tạo từ công tắc vật lý
   currentMode = readSwitchModeWithDebounce();
 
@@ -1034,17 +956,19 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[NET] ✅ Đã kết nối Wi-Fi thành công! IP: %s\n", WiFi.localIP().toString().c_str());
-    if (discoverServerIP(6000)) {
-      initNetworkClients();
-    } else if (strlen(serverIP) > 0) {
-      Serial.printf("[NET] ⚠️ Dùng IP fallback: %s\n", serverIP);
-      initNetworkClients();
-    } else {
-      Serial.println("[NET] ⏳ Chưa tìm thấy Server, sẽ tự động tìm kiếm ngầm trong loop()...");
-    }
   } else {
     Serial.println("[NET] ⚠️ Không kết nối được Wi-Fi trong 5s. Tiếp tục chạy chế độ ngoại tuyến.");
   }
+
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(512);
+  mqttClient.setKeepAlive(30);
+  mqttClient.setSocketTimeout(2);
+
+  webSocket.begin(ws_host, ws_port, ws_path);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(3000);
 
   // 5. Cấu hình OTA an toàn
   ArduinoOTA.setHostname("esp32s3-doorlock");
@@ -1244,22 +1168,12 @@ void loop() {
   // Xử lý nạp OTA
   ArduinoOTA.handle();
 
-  // Quản lý kết nối Mạng & Tự động tìm kiếm Server ngầm nếu chưa có
+  // Quản lý kết nối MQTT (Core 0)
   if (WiFi.status() == WL_CONNECTED) {
-    if (strlen(serverIP) == 0) {
-      static unsigned long lastDiscRetry = 0;
-      if (millis() - lastDiscRetry >= 4000) {
-        lastDiscRetry = millis();
-        if (discoverServerIP(3000)) {
-          initNetworkClients();
-        }
-      }
+    if (!mqttClient.connected()) {
+      tryReconnectMQTT();
     } else {
-      if (!mqttClient.connected()) {
-        tryReconnectMQTT();
-      } else {
-        mqttClient.loop();
-      }
+      mqttClient.loop();
     }
 
     // Gửi phản hồi MQTT an toàn ngoài loop() (Tránh deadlock/corrupt buffer trong callback)
