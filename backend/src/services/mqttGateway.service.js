@@ -45,6 +45,7 @@ class MqttGateway extends EventEmitter {
     const topics = [
       'device/+/status',
       'device/+/events/door',
+      'device/+/events/auth',
       'device/+/events/alarm',
       'device/+/events/enroll_step',
       'device/+/events/enroll_done',
@@ -86,6 +87,14 @@ class MqttGateway extends EventEmitter {
 
         await SystemState.upsert(updateData);
 
+        if (status === 'ONLINE') {
+          Face.findAll({ where: { is_active: false } }).then(inactiveFaces => {
+            for (const f of inactiveFaces) {
+              this.sendToggleFaceCommand(f.face_id, false, deviceId);
+            }
+          }).catch(err => console.warn('Could not sync inactive faces:', err.message));
+        }
+
         this.emit('device_status', { deviceId, status, doorState, securityMode });
       }
 
@@ -106,6 +115,31 @@ class MqttGateway extends EventEmitter {
         );
 
         this.emit('door_event', { deviceId, state });
+      }
+
+      // 2b. device/{id}/events/auth (Xác thực khuôn mặt thành công)
+      else if (subType === 'events' && eventType === 'auth') {
+        const faceId = payload.face_id;
+        const face = await Face.findOne({ where: { face_id: faceId } });
+        const faceName = face ? face.name : `Person #${faceId}`;
+        const roleType = face ? face.role_type : 'PERMANENT';
+
+        const newLog = await AccessLog.create({
+          device_id: deviceId,
+          event_type: 'FACE_AUTH_SUCCESS',
+          face_id: faceId,
+          details: `Xác thực khuôn mặt thành công: ${faceName} (${roleType})`
+        });
+
+        this.emit('auth_event', {
+          id: newLog.id,
+          deviceId,
+          faceId,
+          faceName,
+          roleType,
+          face: face ? { name: face.name, role_type: face.role_type, is_active: face.is_active } : null,
+          timestamp: newLog.timestamp
+        });
       }
 
       // 3. device/{id}/events/alarm
@@ -152,7 +186,7 @@ class MqttGateway extends EventEmitter {
       // 5. device/{id}/events/enroll_done
       else if (subType === 'events' && eventType === 'enroll_done') {
         const faceId = payload.face_id;
-        this.emit('enroll_done', { deviceId, faceId, status: payload.status });
+        this.emit('enroll_done', { deviceId, faceId, status: payload.status, reason: payload.reason });
       }
 
       // 6. device/{id}/events/deleted_done
@@ -215,6 +249,10 @@ class MqttGateway extends EventEmitter {
 
   sendConfigCommand(gracePeriod, deviceId = this.deviceId) {
     return this.publishCommand(`device/${deviceId}/cmd/config`, { grace_period: gracePeriod });
+  }
+
+  sendToggleFaceCommand(faceId, active, deviceId = this.deviceId) {
+    return this.publishCommand(`device/${deviceId}/cmd/toggle_face`, { face_id: faceId, active });
   }
 }
 

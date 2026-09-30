@@ -1,5 +1,14 @@
 #include <Arduino.h>
+#include <atomic>
+#include <esp_arduino_version.h>
+#if ESP_ARDUINO_VERSION_MAJOR != 2 || ESP_ARDUINO_VERSION_MINOR != 0 || ESP_ARDUINO_VERSION_PATCH != 17
+#error "Select esp32 by Espressif Systems 2.0.17 in Boards Manager"
+#endif
+#if !CONFIG_IDF_TARGET_ESP32S3
+#error "Select ESP32S3 Dev Module"
+#endif
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <WebSocketsClient.h>
@@ -50,24 +59,26 @@
 // =================================================================================================
 // 2. THÔNG SỐ MẠNG & MQTT TOPIC HIERARCHY
 // =================================================================================================
-const char* serverIP      = "192.168.1.188"; 
+char        serverIP[16]  = ""; //"10.72.89.67";  // IP may chu Backend/Mosquitto tren mang Wi-Fi (10.72.89.67)
 
-const char* ssid          = "Nguyen Loi";
-const char* password      = "123456NL";
+// const char* ssid          = "Nhat Phat Tokyo";
+// const char* password      = "16666666";
 
-const char* mqtt_server   = serverIP; // Địa chỉ IP máy chạy Docker Mosquitto
+const char* ssid          = "Fee Wi-MESH";
+const char* password      = "cma.khoa";
+
 const int   mqtt_port     = 1883;
 const char* mqtt_user     = "esp32_client";
 const char* mqtt_pass     = "esp32_pass_secure";
 
-const char* ws_host       = serverIP; // Địa chỉ IP máy chạy Backend Service
-const int   ws_port       = 3000;
+int         ws_port       = 3000;
 const char* ws_path       = "/ws/camera/stream";
 
 const char* DEVICE_ID     = "dev_01";
 char topic_status[64];
 char topic_event_door[64];
 char topic_event_alarm[64];
+char topic_event_auth[64];
 char topic_event_enroll_step[64];
 char topic_event_enroll_done[64];
 char topic_event_deleted_done[64];
@@ -77,6 +88,7 @@ char topic_cmd_mode[64];
 char topic_cmd_alarm[64];
 char topic_cmd_stream[64];
 char topic_cmd_config[64];
+char topic_cmd_toggle_face[64];
 char breach_upload_url[128];
 
 // =================================================================================================
@@ -92,34 +104,40 @@ enum AIEventType {
   AI_EVT_AUTH_FAIL,
   AI_EVT_ENROLL_STEP_OK,
   AI_EVT_ENROLL_FINISHED,
-  AI_EVT_ENROLL_FAILED
+  AI_EVT_ENROLL_FAILED,
+  AI_EVT_DELETE_DONE
 };
 
 struct AIEventMsg {
   AIEventType type;
   int face_id;
   int step;
+  uint32_t epoch;
+  uint32_t frameMillis;
+  char reason[48];
 };
+static std::atomic<uint32_t> authEpoch{1};
+
 
 // Queue & Mutex cho FreeRTOS
 QueueHandle_t     aiEventQueue      = NULL;
 SemaphoreHandle_t sharedStateMutex  = NULL;
 
 // Trạng thái an ninh chia sẻ giữa 2 core (bảo vệ bằng Mutex)
-volatile SystemMode currentMode     = MODE_DISARMED;
-volatile bool       isDoorOpen      = false;
-volatile bool       doorStateChanged= false;
-volatile bool       isAuthenticated = false;
-volatile bool       isEnrolling     = false;
-volatile int        enrollStep      = 0;
-volatile bool       streamEnabled   = false; // Mặc định TẮT stream, chỉ stream khi có yêu cầu từ Web
-volatile bool       forcedAlarm     = false;
-volatile bool       armedAlarmLatched = false; // Chốt còi hú công suất tối đa khi bị đột nhập ở MODE_ARMED
-volatile bool       captureBreachRequested = false; // Yêu cầu Core 1 chụp ảnh bằng chứng vi phạm chất lượng cao
-volatile bool       breachSnapshotTaken    = false; // Cờ chốt chống chụp lặp khi cửa đang mở
+std::atomic<SystemMode> currentMode{MODE_DISARMED};
+std::atomic<bool> isDoorOpen{false};
+std::atomic<bool> doorStateChanged{false};
+std::atomic<bool> isAuthenticated{false};
+std::atomic<bool> isEnrolling{false};
+std::atomic<int> enrollStep{0};
+std::atomic<bool> streamEnabled{false}; // Mặc định TẮT stream, chỉ stream khi có yêu cầu từ Web
+std::atomic<bool> forcedAlarm{false};
+std::atomic<bool> armedAlarmLatched{false}; // Chốt còi hú công suất tối đa khi bị đột nhập ở MODE_ARMED
+std::atomic<bool> captureBreachRequested{false}; // Yêu cầu Core 1 chụp ảnh bằng chứng vi phạm chất lượng cao
+std::atomic<bool> breachSnapshotTaken{false}; // Cờ chốt chống chụp lặp khi cửa đang mở
 
 unsigned long       authSuccessMillis = 0;
-unsigned long       gracePeriodMs     = 10000; // Mặc định 10 giây (tùy chỉnh 5 - 15 giây từ xa qua Web)
+std::atomic<unsigned long> gracePeriodMs{10000}; // Mặc định 10 giây (tùy chỉnh 5 - 15 giây từ xa qua Web)
 
 // Quản lý Flash NVS
 const char* PREF_NAMESPACE = "face_nvs";
@@ -132,10 +150,10 @@ TaskHandle_t aiCameraTaskHandle = NULL;
 
 // Non-blocking MQTT reconnect timer & Cờ gửi tin an toàn
 unsigned long lastMqttRetry = 0;
-volatile bool statusPublishPending = false;
-volatile bool deleteDoneEventPending = false;
-volatile int  deleteDoneFaceId = 0;
-volatile bool deleteDoneResult = false;
+std::atomic<bool> statusPublishPending{false};
+std::atomic<bool> deleteDoneEventPending{false};
+std::atomic<int> deleteDoneFaceId{0};
+std::atomic<bool> deleteDoneResult{false};
 
 // Bộ đệm tiếng còi beep theo mẫu (Pattern Beeper)
 int buzzerBeepRemaining = 0;
@@ -233,7 +251,7 @@ void IRAM_ATTR onDoorInterrupt() {
   static int64_t lastInterruptTime = 0;
   int64_t now = esp_timer_get_time() / 1000ULL; // IRAM-safe timer
   if (now - lastInterruptTime > 50) { // Lọc rung >= 50ms
-    isDoorOpen = (digitalRead(DOOR_PIN) == HIGH); // Hở mạch = Cửa mở
+    isDoorOpen = false;//(digitalRead(DOOR_PIN) == HIGH); // Hở mạch = Cửa mở
     doorStateChanged = true;
     lastInterruptTime = now;
   }
@@ -258,7 +276,7 @@ SystemMode readSwitchModeWithDebounce() {
     lastRawMode = rawMode;
   }
 
-  if ((millis() - lastDebounceTime) >= 50) {
+  if ((millis() - lastDebounceTime) >= 30) {
     stableMode = rawMode;
   }
 
@@ -277,7 +295,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       Serial.printf("✅ [WS CAMERA] Đã kết nối thành công tới máy chủ stream: %s\n", payload);
       break;
     case WStype_TEXT:
-      Serial.printf("[WS CAMERA] Nhận phản hồi: %s\n", payload);
+      Serial.printf("[WS CAMERA] Nhận phản hồi: %.*s\n", (int)length, (const char*)payload);
       break;
     case WStype_BIN:
       break;
@@ -297,7 +315,7 @@ bool initCamera() {
   Serial.println("==========================================");
   Serial.printf("-> Internal Free Heap: %d bytes\n", ESP.getFreeHeap());
 
-  camera_config_t config;
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
   config.pin_d0       = Y2_GPIO_NUM;
@@ -317,23 +335,20 @@ bool initCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_UXGA;
+  config.frame_size   = FRAMESIZE_QVGA; // Khởi tạo trực tiếp QVGA để DMA tối ưu tốc độ và không lãng phí RAM
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode    = CAMERA_GRAB_LATEST; // Luôn lấy frame mới nhất, triệt tiêu lag/delay stream
   config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count     = 1;
+  config.jpeg_quality = 15; // Tối ưu cân bằng: giữ frame ~6-8KB ngay cả khi có khuôn mặt/quần áo chi tiết, tránh nghẽn TCP
+  config.fb_count     = 2;  // Double buffer: camera and consumer
 
-  // Cấu hình PSRAM chuẩn 100% theo CameraWebServer
+  // Cấu hình PSRAM chuẩn
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
-      config.jpeg_quality = 10;
-      config.fb_count     = 2;
-      config.grab_mode    = CAMERA_GRAB_LATEST;
       Serial.printf("-> PSRAM OK: Total %u B, Free %u B\n", (unsigned int)ESP.getPsramSize(), (unsigned int)ESP.getFreePsram());
     } else {
-      config.frame_size   = FRAMESIZE_SVGA;
       config.fb_location  = CAMERA_FB_IN_DRAM;
+      config.fb_count     = 1;
       Serial.println("-> CẢNH BÁO: Không có PSRAM!");
     }
   }
@@ -365,350 +380,20 @@ bool initCamera() {
     s->set_bpc(s, 1);               // Sửa điểm ảnh đen (Black Pixel Correction)
     s->set_wpc(s, 1);               // Sửa điểm ảnh trắng (White Pixel Correction)
     s->set_saturation(s, 0);        // Mức bão hòa chuẩn (tránh bệt màu da)
+
+    // Bù sáng ngược sáng (Backlight / Ceiling lamp compensation) & Tự động tăng sáng trong phòng tối
+    s->set_exposure_ctrl(s, 1);     // Bật Auto Exposure (AEC)
+    s->set_aec2(s, 1);              // Bật thuật toán đo sáng nâng cao DSP AEC2 (ưu tiên trung tâm khuôn mặt thay vì bị lóa bởi đèn trần)
+    s->set_ae_level(s, 1);          // Nâng mức phơi sáng +1 EV giúp khuôn mặt bị khuất bóng sáng rõ nét
+    s->set_gain_ctrl(s, 1);         // Bật Auto Gain (AGC)
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_4X); // Cho phép tăng sáng nhạy khi ánh sáng phòng yếu
   }
 
   Serial.println("✅ Camera OV5640 khởi tạo thành công (100% chuẩn CameraWebServer)!\n");
   return true;
 }
 
-// =================================================================================================
-// 6. QUẢN LÝ FLASH NVS (LƯU TRỮ VÀ XÓA KHUÔN MẶT ĐẢM BẢO THREAD-SAFE GIỮA 2 CORE)
-// =================================================================================================
-int getEnrolledFacesCount() {
-  Preferences p;
-  p.begin(PREF_NAMESPACE, true);
-  int count = p.getInt("count", 0);
-  p.end();
-  return count;
-}
-
-int generateNextFaceId() {
-  Preferences p;
-  p.begin(PREF_NAMESPACE, false);
-  int nextId = p.getInt("next_id", 1);
-  p.putInt("next_id", nextId + 1);
-  p.end();
-  return nextId;
-}
-
-bool saveFaceToNVS(int faceId) {
-  Preferences p;
-  p.begin(PREF_NAMESPACE, false);
-  char key[16];
-  snprintf(key, sizeof(key), "face_%d", faceId);
-  p.putBool(key, true);
-
-  int count = p.getInt("count", 0);
-  p.putInt("count", count + 1);
-  p.end();
-  return true;
-}
-
-bool deleteFaceFromNVS(int faceId) {
-  Preferences p;
-  p.begin(PREF_NAMESPACE, false);
-  char key[16];
-  snprintf(key, sizeof(key), "face_%d", faceId);
-  
-  if (p.isKey(key)) {
-    p.remove(key);
-    int count = p.getInt("count", 1);
-    if (count > 0) p.putInt("count", count - 1);
-    p.end();
-    return true;
-  }
-  p.end();
-  return false;
-}
-
-bool verifyFaceOffline(int faceId) {
-  Preferences p;
-  p.begin(PREF_NAMESPACE, true);
-  char key[16];
-  snprintf(key, sizeof(key), "face_%d", faceId);
-  bool exists = p.getBool(key, false);
-  p.end();
-  return exists;
-}
-
-// =================================================================================================
-// 7. THUẬT TOÁN PHÁT HIỆN & NHẬN DIỆN KHUÔN MẶT CỤC BỘ TRÊN ESP32-S3
-// =================================================================================================
-bool detectFaceInFrame(camera_fb_t *fb) {
-  if (!fb || fb->len == 0) return false;
-  if (!psramFound()) return false;
-
-  // Cấp phát buffer RGB trong 8MB PSRAM (QVGA 320x240x3 = 230.4 KB)
-  static uint8_t *rgb_buf = NULL;
-  if (rgb_buf == NULL) {
-    rgb_buf = (uint8_t *)ps_malloc(320 * 240 * 3);
-    if (!rgb_buf) {
-      Serial.println("[AI-CORE1] ❌ Lỗi cấp phát PSRAM cho RGB buffer!");
-      return false;
-    }
-  }
-
-  // Chuyển đổi JPEG QVGA sang RGB888
-  bool converted = fmt2rgb888(fb->buf, fb->len, fb->format, rgb_buf);
-  if (!converted) return false;
-
-  int skinPixels = 0;
-  int minX = 320, maxX = 0, minY = 240, maxY = 0;
-  long sumX = 0, sumY = 0;
-
-  // Quét lưới ma trận trung tâm với bước nhảy STEP = 4 (quét ~3500 điểm mẫu trong < 2ms)
-  const int STEP = 4;
-  for (int y = 16; y < 224; y += STEP) {
-    for (int x = 24; x < 296; x += STEP) {
-      int idx = (y * 320 + x) * 3;
-      int r = rgb_buf[idx];
-      int g = rgb_buf[idx + 1];
-      int b = rgb_buf[idx + 2];
-
-      // Chuyển đổi sang không gian màu YCbCr
-      int cb = (-169 * r - 331 * g + 500 * b) / 1000 + 128;
-      int cr = ( 500 * r - 419 * g -  81 * b) / 1000 + 128;
-
-      // Phân đoạn dải màu da người (Human Face Skin Chrominance Bounds)
-      if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173) {
-        if (r > 60 && g > 40 && b > 20 && r > g && (r - g) >= 12) {
-          skinPixels++;
-          sumX += x;
-          sumY += y;
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-        }
-      }
-    }
-  }
-
-  // 1. Kiểm tra diện tích vùng da mặt: Phải đủ kích thước khuôn mặt thực tế
-  if (skinPixels < 100 || skinPixels > 1600) {
-    return false; // Quá ít (không có người) hoặc quá nhiều (bị che kín / chói lóa)
-  }
-
-  int boxW = maxX - minX;
-  int boxH = maxY - minY;
-
-  // 2. Kích thước bounding box tối thiểu ở cự ly mở cửa (30cm - 1.2m)
-  if (boxW < 40 || boxH < 48) {
-    return false;
-  }
-
-  // 3. Tỉ lệ khung hình học khuôn mặt người (Chiều cao / Chiều rộng: 0.85 -> 2.0)
-  float aspect = (float)boxH / (float)boxW;
-  if (aspect < 0.85f || aspect > 2.0f) {
-    return false;
-  }
-
-  // 4. Mật độ phân bố vùng da bên trong khung
-  int totalSampledInBox = (boxW / STEP) * (boxH / STEP);
-  if (totalSampledInBox > 0) {
-    float density = (float)skinPixels / (float)totalSampledInBox;
-    if (density < 0.25f || density > 0.90f) {
-      return false;
-    }
-  }
-
-  // 5. Tọa độ tâm khuôn mặt phải nằm trong góc nhìn hợp lệ của camera
-  int centerX = sumX / skinPixels;
-  int centerY = sumY / skinPixels;
-  if (centerX < 50 || centerX > 270 || centerY < 35 || centerY > 205) {
-    return false;
-  }
-
-  return true; // Xác nhận có khuôn mặt người hợp lệ!
-}
-
-// =================================================================================================
-// 8. CORE 1 TASK: THU THẬP KHUNG HÌNH, STREAM NHỊ PHÂN & XỬ LÝ AI
-// =================================================================================================
-void aiCameraTask(void *pvParameters) {
-  unsigned long lastSimulatedScan = 0;
-  unsigned long enrollStepTimer   = 0;
-  int internalEnrollStep = 0;
-  unsigned long frameCount = 0;
-  unsigned long lastDebugPrint = 0;
-  unsigned long lastWsFrameTime = 0;
-  int consecutiveFaceHits = 0;
-
-  Serial.println("🚀 [CORE 1] AI Camera Task đã khởi động!");
-
-  while (true) {
-    // 1. Luôn duy trì WebSocket loop ngay đầu vòng lặp để không bị timeout/ngắt kết nối
-    if (WiFi.status() == WL_CONNECTED) {
-      webSocket.loop();
-    }
-
-    // 2. Đọc trạng thái đồng bộ an toàn qua Mutex
-    bool localEnrolling = false;
-    bool localStreaming = false;
-    bool localAuth      = false;
-    SystemMode localMode = MODE_DISARMED;
-
-    if (xSemaphoreTake(sharedStateMutex, (TickType_t)5) == pdTRUE) {
-      localEnrolling = isEnrolling;
-      localStreaming = streamEnabled;
-      localAuth      = isAuthenticated;
-      localMode      = currentMode;
-      xSemaphoreGive(sharedStateMutex);
-    }
-
-    // 2.5. XỬ LÝ CHỤP ẢNH BẰNG CHỨNG VI PHẠM KHI ĐỘT NHẬP Ở CHẾ ĐỘ ARMED (KHÔNG ĐỔI FRAMESIZE TRÁNH CRASH CAMERA DMA)
-    if (captureBreachRequested) {
-      captureBreachRequested = false;
-      Serial.println("[AI-CORE1] 🚨 Phát hiện vi phạm ARMED! Đang chụp ảnh bằng chứng Full-Color chất lượng cao...");
-
-      sensor_t *s = esp_camera_sensor_get();
-      if (s != NULL) {
-        s->set_quality(s, 10);        // Thiết lập chất lượng nén JPEG tốt nhất (sắc nét, không vỡ hạt)
-        s->set_special_effect(s, 0);  // Đảm bảo ảnh màu nguyên bản (24-bit Full Color, không Grayscale)
-      }
-
-      // Chụp khung hình chất lượng cao trực tiếp (không đổi framesize để giữ ổn định 100% cho DMA FIFO OV5640)
-      camera_fb_t *breachFb = esp_camera_fb_get();
-      if (breachFb && breachFb->len > 0) {
-        Serial.printf("[AI-CORE1] 📸 Chụp thành công ảnh vi phạm (%u bytes). Đang gửi lên Server...\n", breachFb->len);
-
-        if (WiFi.status() == WL_CONNECTED) {
-          HTTPClient http;
-          http.begin(breach_upload_url);
-          http.addHeader("Content-Type", "image/jpeg");
-          http.addHeader("X-Device-Id", DEVICE_ID);
-          http.addHeader("X-Mode", "ARMED");
-          http.setTimeout(2500); // Timeout 2.5s an toàn cho FreeRTOS
-
-          int httpCode = http.POST(breachFb->buf, breachFb->len);
-          if (httpCode == HTTP_CODE_OK || httpCode == 201) {
-            Serial.printf("[AI-CORE1] ✅ Tải ảnh vi phạm lên Server thành công! HTTP %d\n", httpCode);
-          } else {
-            Serial.printf("[AI-CORE1] ⚠️ Tải ảnh vi phạm thất bại. HTTP Code: %d\n", httpCode);
-          }
-          http.end();
-        } else {
-          Serial.println("[AI-CORE1] ⚠️ Wi-Fi chưa kết nối, không thể tải ảnh vi phạm lên Server.");
-        }
-
-        esp_camera_fb_return(breachFb);
-      }
-
-      if (s != NULL) {
-        s->set_quality(s, 12); // Trả lại chất lượng tiêu chuẩn cho luồng stream & AI
-      }
-      vTaskDelay(pdMS_TO_TICKS(10)); // Nhường nhẹ CPU để reset watchdog timer
-    }
-
-    // 3. QUY TRÌNH ĐĂNG KÝ KHUÔN MẶT 3 GÓC (FACE ENROLLMENT PIPELINE)
-    if (localEnrolling) {
-      if (internalEnrollStep == 0) {
-        internalEnrollStep = 1;
-        enrollStepTimer = millis();
-        AIEventMsg msg = { AI_EVT_ENROLL_STEP_OK, 0, 1 };
-        xQueueSend(aiEventQueue, &msg, 0);
-        Serial.println("[AI-CORE1] 📸 Bước 1: Góc thẳng OK -> Gửi Queue");
-      }
-      else if (internalEnrollStep == 1 && (millis() - enrollStepTimer >= 3500)) {
-        // Góc 2 (Nghiêng)
-        internalEnrollStep = 2;
-        enrollStepTimer = millis();
-        AIEventMsg msg = { AI_EVT_ENROLL_STEP_OK, 0, 2 };
-        xQueueSend(aiEventQueue, &msg, 0);
-        Serial.println("[AI-CORE1] 📸 Bước 2: Nghiêng 1 OK -> Gửi Queue");
-      }
-      else if (internalEnrollStep == 2 && (millis() - enrollStepTimer >= 3500)) {
-        // Góc 3 (Góc còn lại)
-        internalEnrollStep = 3;
-        enrollStepTimer = millis();
-        AIEventMsg msg = { AI_EVT_ENROLL_STEP_OK, 0, 3 };
-        xQueueSend(aiEventQueue, &msg, 0);
-        Serial.println("[AI-CORE1] 📸 Bước 3: Nghiêng 2 OK -> Gửi Queue");
-      }
-      else if (internalEnrollStep == 3 && (millis() - enrollStepTimer >= 3000)) {
-        // Hoàn tất 3 góc: Đóng gói và lưu Flash NVS
-        int newId = generateNextFaceId();
-        saveFaceToNVS(newId);
-
-        internalEnrollStep = 0;
-        AIEventMsg msg = { AI_EVT_ENROLL_FINISHED, newId, 3 };
-        xQueueSend(aiEventQueue, &msg, 0);
-        Serial.printf("[AI-CORE1] ✅ Hoàn tất 3 góc -> Lưu NVS Face ID #%d -> Gửi Queue\n", newId);
-      }
-    } 
-    else {
-      internalEnrollStep = 0;
-    }
-
-    // 4. QUY TRÌNH TỰ ĐỘNG QUÉT & XÁC THỰC KHUÔN MẶT TRONG CHẾ ĐỘ STAY / ARMED
-    static unsigned long lastAuthTriggerMillis = 0;
-    static unsigned long lastFaceScanTime      = 0;
-    bool authCooldownOk = (millis() - lastAuthTriggerMillis >= (gracePeriodMs + 4000));
-    bool needScanFace   = (localMode == MODE_ARMED || localMode == MODE_STAY) && !localEnrolling && !localAuth && authCooldownOk;
-
-    if (needScanFace || localStreaming) {
-      bool timeForScan   = needScanFace && (millis() - lastFaceScanTime >= 350); // Quét khuôn mặt mỗi 350ms
-      bool timeForStream = localStreaming && (millis() - lastWsFrameTime >= 65);  // Stream ~15 FPS
-
-      if (timeForScan || timeForStream) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb != NULL) {
-          frameCount++;
-
-          // 4.1. Đẩy frame qua WebSocket nếu đang bật Stream
-          if (localStreaming && timeForStream) {
-            lastWsFrameTime = millis();
-            if (WiFi.status() == WL_CONNECTED && webSocket.isConnected() && fb->len > 0) {
-              webSocket.sendBIN(fb->buf, fb->len);
-            }
-          }
-
-          // 4.2. Quét & đối chiếu hình thái khuôn mặt thực tế với Flash NVS
-          if (timeForScan) {
-            lastFaceScanTime = millis();
-            int enrolledCount = getEnrolledFacesCount();
-            if (enrolledCount > 0) {
-              bool hasFace = detectFaceInFrame(fb);
-              if (hasFace) {
-                consecutiveFaceHits++;
-                Serial.printf("[AI-CORE1] 👤 Phát hiện khuôn mặt trong khung hình (Khớp %d/2 frame)...\n", consecutiveFaceHits);
-                // Xác thực chắc chắn qua 2 frame liên tiếp để chống nhận diện nhầm
-                if (consecutiveFaceHits >= 2) {
-                  consecutiveFaceHits = 0;
-                  lastAuthTriggerMillis = millis(); // Ghi nhận mốc kích hoạt để bắt đầu thời gian ân hạn
-                  AIEventMsg authMsg = { AI_EVT_AUTH_SUCCESS, 1, 0 };
-                  xQueueSend(aiEventQueue, &authMsg, 0);
-                  Serial.printf("[AI-CORE1] 🟢 XÁC THỰC KHUÔN MẶT THÀNH CÔNG (NVS: %d hồ sơ)! Cho phép mở cửa.\n", enrolledCount);
-                }
-              } else {
-                consecutiveFaceHits = 0;
-              }
-            } else if (enrolledCount == 0 && (millis() - lastDebugPrint >= 5000)) {
-              Serial.println("[AI-CORE1] ℹ️ Chưa có khuôn mặt nào trong Flash NVS. Hãy bấm 'Đăng ký khuôn mặt' trên Web.");
-            }
-          }
-
-          if (millis() - lastDebugPrint >= 5000) {
-            lastDebugPrint = millis();
-            Serial.printf("[AI-STATUS] Mode: %s | Auth: %s | Stream: %s | NVS Faces: %d\n",
-              (localMode == MODE_ARMED) ? "ARMED" : (localMode == MODE_STAY ? "STAY" : "DISARMED"),
-              localAuth ? "YES" : "NO",
-              localStreaming ? "ON" : "OFF",
-              getEnrolledFacesCount()
-            );
-          }
-
-          esp_camera_fb_return(fb);
-        }
-      }
-      vTaskDelay(pdMS_TO_TICKS(15));
-    } else {
-      consecutiveFaceHits = 0;
-      // Khi ở chế độ DISARMED hoặc đang trong thời gian ân hạn: Nghỉ 100ms để tiết kiệm CPU
-      vTaskDelay(pdMS_TO_TICKS(100));
-    }
-  }
-}
+#include "FaceRuntime.h"
 
 // =================================================================================================
 // 8. GIAO TIẾP MQTT & XỬ LÝ SỰ KIỆN QOS 1
@@ -744,6 +429,15 @@ void sendAlarmBreachEvent() {
   char buf[128];
   serializeJson(doc, buf);
   mqttClient.publish(topic_event_alarm, buf);
+}
+
+void sendAuthEvent(int faceId) {
+  StaticJsonDocument<128> doc;
+  doc["face_id"] = faceId;
+  doc["status"]  = "SUCCESS";
+  char buf[128];
+  serializeJson(doc, buf);
+  mqttClient.publish(topic_event_auth, buf);
 }
 
 void sendEnrollStepEvent(int step, const char* angleName) {
@@ -785,9 +479,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // Lệnh đồng bộ chế độ an ninh
   if (strcmp(topic, topic_cmd_mode) == 0) {
-    const char* mode = doc["mode"];
+    const char* mode = doc["mode"] | "";
     if (xSemaphoreTake(sharedStateMutex, (TickType_t)10) == pdTRUE) {
-      SystemMode newMode = currentMode;
+      SystemMode newMode = currentMode.load();
       if (strcmp(mode, "ARMED") == 0) {
         newMode = MODE_ARMED;
       } else if (strcmp(mode, "STAY") == 0) {
@@ -797,6 +491,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       }
 
       if (newMode != currentMode) {
+        ++authEpoch;
+        isEnrolling = false; enrollStep = 0;
         currentMode = newMode;
         isAuthenticated = false; // Reset xác thực ngay khi chuyển chế độ
         authSuccessMillis = 0;
@@ -814,6 +510,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   else if (strcmp(topic, topic_cmd_enroll) == 0) {
     const char* cmd = doc["cmd"] | "";
     if (xSemaphoreTake(sharedStateMutex, (TickType_t)10) == pdTRUE) {
+      ++authEpoch;
+      isAuthenticated = false; authSuccessMillis = 0;
       if (strcmp(cmd, "CANCEL") == 0 || strcmp(cmd, "STOP") == 0 || (doc.containsKey("enable") && !doc["enable"])) {
         isEnrolling = false;
         enrollStep = 0;
@@ -827,13 +525,22 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       xSemaphoreGive(sharedStateMutex);
     }
   }
-  // Lệnh xóa khuôn mặt khỏi Flash MCU
+  // Lệnh xóa khuôn mặt khỏi Flash MCU (xóa 1 mặt hoặc xóa toàn bộ)
   else if (strcmp(topic, topic_cmd_delete) == 0) {
-    int faceId = doc["face_id"];
-    bool deleted = deleteFaceFromNVS(faceId);
-    deleteDoneFaceId = faceId;
-    deleteDoneResult = deleted;
-    deleteDoneEventPending = true; // Gửi sự kiện an toàn ngoài loop()
+    int id = ((doc["all"] | false) || (doc["face_id"] | 0) == -1) ? -1 : (doc["face_id"] | 0);
+    xSemaphoreTake(sharedStateMutex, portMAX_DELAY);
+    ++authEpoch; isAuthenticated = false; isEnrolling = false; enrollStep = 0;
+    xSemaphoreGive(sharedStateMutex);
+    bool queued=false;
+    if (id != 0 && deleteQueue && !deletePending.exchange(true)) {
+      queued=xQueueSend(deleteQueue,&id,0)==pdTRUE;
+      if(!queued) deletePending=false;
+    }
+    if(!queued) {
+      StaticJsonDocument<128> reply;
+      reply["face_id"]=id; reply["status"]="FAILED"; reply["reason"]="BUSY_OR_INVALID_ID";
+      char buf[128];serializeJson(reply,buf);mqttClient.publish(topic_event_deleted_done,buf);
+    }
   }
   // Lệnh bật/tắt còi cưỡng bức khẩn cấp hoặc tắt còi trực tiếp từ Web
   else if (strcmp(topic, topic_cmd_alarm) == 0) {
@@ -864,12 +571,22 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       }
     }
   }
+  // Lệnh bật/tắt kích hoạt khuôn mặt (Active / Inactive) từ Web
+  else if (strcmp(topic, topic_cmd_toggle_face) == 0) {
+    int faceId = doc["face_id"] | 0;
+    bool active = doc.containsKey("active") ? (bool)doc["active"] : true;
+    if (faceId > 0 && faceId <= 31) {
+      FaceEngine::setFaceActive(faceId, active);
+      Serial.printf("[FACE] Cập nhật person=%d active=%s (mask=0x%08X)\n",
+                    faceId, active ? "BẬT" : "TẮT", FaceEngine::activeFacesMask.load());
+    }
+  }
 }
 
 // Tái kết nối MQTT không chặn (Non-blocking) để đảm bảo hoạt động ngoại tuyến khi mất Wi-Fi
 void tryReconnectMQTT() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (millis() - lastMqttRetry < 5000) return; // Thử lại sau mỗi 5 giây
+  if (WiFi.status() != WL_CONNECTED || strlen(serverIP) == 0) return;
+  if (millis() - lastMqttRetry < 5000) return; // Thu lai sau moi 5 giay
   lastMqttRetry = millis();
 
   StaticJsonDocument<64> lwt;
@@ -885,7 +602,65 @@ void tryReconnectMQTT() {
     mqttClient.subscribe(topic_cmd_alarm);
     mqttClient.subscribe(topic_cmd_stream);
     mqttClient.subscribe(topic_cmd_config);
+    mqttClient.subscribe(topic_cmd_toggle_face);
   }
+}
+
+// ponytail: UDP discovery with auto-retry in loop, both active ping and passive listen
+bool discoverServerIP(uint32_t timeoutMs = 4000) {
+  if (strlen(serverIP) > 0) return true;
+  WiFiUDP udp;
+  if (!udp.begin(8888)) {
+    Serial.println("[NET] ❌ Không thể mở UDP port 8888!");
+    return false;
+  }
+  Serial.printf("[NET] 🔍 Đang tìm kiếm Server qua UDP port 8888 (chờ %ds)...\n", timeoutMs / 1000);
+
+  // Gửi gói tin chủ động hỏi Server (cả 255.255.255.255 và Directed Subnet Broadcast)
+  udp.beginPacket("255.255.255.255", 8888);
+  udp.print("{\"cmd\":\"DISCOVER_SERVER\"}");
+  udp.endPacket();
+
+  IPAddress bcast = ~WiFi.subnetMask() | WiFi.localIP();
+  udp.beginPacket(bcast, 8888);
+  udp.print("{\"cmd\":\"DISCOVER_SERVER\"}");
+  udp.endPacket();
+
+  char buf[128];
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (udp.parsePacket() > 0) {
+      int n = udp.read(buf, sizeof(buf) - 1);
+      buf[n > 0 ? n : 0] = '\0';
+      if (strstr(buf, "\"service\":\"esp32_security_backend\"")) {
+        snprintf(serverIP, sizeof(serverIP), "%s", udp.remoteIP().toString().c_str());
+        char* p = strstr(buf, "\"port\":");
+        if (p) sscanf(p + 7, "%d", &ws_port);
+        Serial.printf("[NET] 🎯 Discovered server: %s:%d\n", serverIP, ws_port);
+        udp.stop();
+        return true;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  udp.stop(); // ponytail: drop socket immediately to free lwIP PCB
+  return false;
+}
+
+static bool networkClientsConfigured=false;
+void initNetworkClients() {
+  if (strlen(serverIP) == 0) return;
+  snprintf(breach_upload_url, sizeof(breach_upload_url), "http://%s:%d/api/logs/breach-capture", serverIP, ws_port);
+
+  mqttClient.setServer(serverIP, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(512);
+  mqttClient.setKeepAlive(30);
+  mqttClient.setSocketTimeout(1);
+
+  wsInitRequested = true; // Only cameraStream task owns WebSocket client
+  networkClientsConfigured=true;
+  Serial.printf("[NET] 🌐 Khởi tạo kết nối tới Server: %s (WS:%d, MQTT:%d)\n", serverIP, ws_port, mqtt_port);
 }
 
 // =================================================================================================
@@ -903,6 +678,8 @@ void setup() {
   sharedStateMutex = xSemaphoreCreateMutex();
   aiEventQueue     = xQueueCreate(10, sizeof(AIEventMsg));
 
+  if (!sharedStateMutex || !aiEventQueue) { Serial.println("[FATAL] RTOS allocation failed"); while(true) delay(1000); }
+
   // 2. Khởi tạo chân I/O ngoại vi
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW); // Chống hú còi lúc khởi động
@@ -911,7 +688,7 @@ void setup() {
   pinMode(SW_PIN_2, INPUT_PULLUP);
 
   pinMode(DOOR_PIN, INPUT_PULLUP);
-  isDoorOpen = (digitalRead(DOOR_PIN) == HIGH);
+  isDoorOpen = false;//(digitalRead(DOOR_PIN) == HIGH);
   attachInterrupt(digitalPinToInterrupt(DOOR_PIN), onDoorInterrupt, CHANGE);
 
   pinMode(LED_R_PIN, OUTPUT); digitalWrite(LED_R_PIN, LOW);
@@ -922,6 +699,7 @@ void setup() {
   snprintf(topic_status, sizeof(topic_status), "device/%s/status", DEVICE_ID);
   snprintf(topic_event_door, sizeof(topic_event_door), "device/%s/events/door", DEVICE_ID);
   snprintf(topic_event_alarm, sizeof(topic_event_alarm), "device/%s/events/alarm", DEVICE_ID);
+  snprintf(topic_event_auth, sizeof(topic_event_auth), "device/%s/events/auth", DEVICE_ID);
   snprintf(topic_event_enroll_step, sizeof(topic_event_enroll_step), "device/%s/events/enroll_step", DEVICE_ID);
   snprintf(topic_event_enroll_done, sizeof(topic_event_enroll_done), "device/%s/events/enroll_done", DEVICE_ID);
   snprintf(topic_event_deleted_done, sizeof(topic_event_deleted_done), "device/%s/events/deleted_done", DEVICE_ID);
@@ -931,8 +709,7 @@ void setup() {
   snprintf(topic_cmd_alarm, sizeof(topic_cmd_alarm), "device/%s/cmd/alarm", DEVICE_ID);
   snprintf(topic_cmd_stream, sizeof(topic_cmd_stream), "device/%s/cmd/stream", DEVICE_ID);
   snprintf(topic_cmd_config, sizeof(topic_cmd_config), "device/%s/cmd/config", DEVICE_ID);
-  snprintf(breach_upload_url, sizeof(breach_upload_url), "http://%s:%d/api/logs/breach-capture", serverIP, ws_port);
-
+  snprintf(topic_cmd_toggle_face, sizeof(topic_cmd_toggle_face), "device/%s/cmd/toggle_face", DEVICE_ID);
   // Đọc chế độ an ninh khởi tạo từ công tắc vật lý
   currentMode = readSwitchModeWithDebounce();
 
@@ -946,7 +723,6 @@ void setup() {
   Serial.printf("[NET] Đang kết nối Wi-Fi: %s ...\n", ssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  WiFi.setSleep(false); // Vô hiệu hóa chế độ ngủ Modem Wi-Fi: Giảm độ trễ gói tin
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 5000) {
     delay(200);
@@ -955,110 +731,113 @@ void setup() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setSleep(false); // Vô hiệu hóa triệt để Modem Sleep SAU KHI kết nối Wi-Fi!
     Serial.printf("[NET] ✅ Đã kết nối Wi-Fi thành công! IP: %s\n", WiFi.localIP().toString().c_str());
+    if (discoverServerIP(6000)) {
+      initNetworkClients();
+    } else if (strlen(serverIP) > 0) {
+      Serial.printf("[NET] ⚠️ Dùng IP fallback: %s\n", serverIP);
+      initNetworkClients();
+    } else {
+      Serial.println("[NET] ⏳ Chưa tìm thấy Server, sẽ tự động tìm kiếm ngầm trong loop()...");
+    }
   } else {
     Serial.println("[NET] ⚠️ Không kết nối được Wi-Fi trong 5s. Tiếp tục chạy chế độ ngoại tuyến.");
   }
 
-  mqttClient.setServer(mqtt_server, mqtt_port);
-  mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(512);
-  mqttClient.setKeepAlive(30);
-  mqttClient.setSocketTimeout(2);
-
-  webSocket.begin(ws_host, ws_port, ws_path);
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(3000);
-
   // 5. Cấu hình OTA an toàn
   ArduinoOTA.setHostname("esp32s3-doorlock");
   ArduinoOTA.onStart([]() {
-    if (aiCameraTaskHandle != NULL) {
-      vTaskDelete(aiCameraTaskHandle);
-    }
+    otaStopping = true;
+    ++authEpoch; isAuthenticated = false; isEnrolling = false;
     digitalWrite(RELAY_PIN, LOW);
-    digitalWrite(LED_R_PIN, LOW);
-    digitalWrite(LED_G_PIN, LOW);
-    digitalWrite(LED_B_PIN, LOW);
-    esp_camera_deinit();
+    digitalWrite(LED_R_PIN, LOW); digitalWrite(LED_G_PIN, LOW); digitalWrite(LED_B_PIN, LOW);
+    // Do not delete a task while it holds a frame/mutex or is inside ESP-DL.
+    // Workers park cooperatively; OTA completion reboots the device.
+  });
+  ArduinoOTA.onError([](ota_error_t) {
+    Serial.println("[OTA] Failed; restarting to restore a clean camera/AI state");
+    ESP.restart();
   });
   ArduinoOTA.begin();
 
-  // 6. Khởi chạy tác vụ AI & Camera trên Core 1 sau khi toàn bộ hệ thống đã sẵn sàng
-  if (camOk) {
-    Serial.println("[SYSTEM] ✅ Khởi chạy tác vụ AI Camera trên Core 1...");
-    xTaskCreatePinnedToCore(
-      aiCameraTask,
-      "aiCameraTask",
-      12288, // Tăng stack lên 12KB chống tràn stack khi gọi HTTPClient
-      NULL,
-      1, // Priority 1: Chuẩn hợp tác FreeRTOS
-      &aiCameraTaskHandle,
-      1  // Core 1
-    );
+  if (camOk && !startFaceTasks()) {
+    Serial.println("[SYSTEM] Cannot start face workers. Authentication DISABLED.");
+    aiReady=false;
   }
+
 }
 
 void loop() {
-  // 1. Luôn ưu tiên đọc công tắc chuyển chế độ vật lý ngay đầu vòng lặp
+  if (otaStopping) { ArduinoOTA.handle(); delay(2); return; }
+  // 1. Luon uu tien doc cong tac chuyen che do vat ly ngay dau vong lap
   SystemMode swMode = readSwitchModeWithDebounce();
-  static SystemMode prevSw = currentMode;
+  static SystemMode prevSw = currentMode.load();
   if (swMode != prevSw) {
-    prevSw = swMode;
-    if (xSemaphoreTake(sharedStateMutex, (TickType_t)10) == pdTRUE) {
+    if (xSemaphoreTake(sharedStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      prevSw = swMode;
       currentMode = swMode;
-      isEnrolling = false; // Tự động hủy nạp mặt nếu đang nạp mà gạt công tắc
+      ++authEpoch;
+      isEnrolling = false; // Tu dong huy nap mat neu dang nap ma gat cong tac
       enrollStep = 0;
-      isAuthenticated = false; // Reset xác thực ngay khi gạt công tắc
+      isAuthenticated = false; // Reset xac thuc ngay khi gat cong tac
       authSuccessMillis = 0;
-      armedAlarmLatched = false; // Luôn reset chốt còi báo động khi gạt công tắc đổi chế độ
+      armedAlarmLatched = false; // Luon reset chot coi bao dong khi gat cong tac doi che do
       if (currentMode == MODE_DISARMED) {
         forcedAlarm = false;
         BuzzerControl(BUZZER_OFF);
       }
-      triggerBuzzerPattern(1, 150, 100); // Beep 1 lần khi gạt công tắc chuyển chế độ
+      triggerBuzzerPattern(1, 150, 100); // Beep 1 lan khi gat cong tac chuyen che do
       statusPublishPending = true;
       xSemaphoreGive(sharedStateMutex);
     }
   }
 
-  // 2. Tiếp nhận sự kiện từ AI Task (Core 1) gửi sang qua Queue
+  // Consume only fresh events from the current command generation.
   AIEventMsg evt;
-  if (xQueueReceive(aiEventQueue, &evt, 0) == pdTRUE) {
-    switch (evt.type) {
+  while (xQueueReceive(aiEventQueue, &evt, 0) == pdTRUE) {
+    if(evt.type == AI_EVT_DELETE_DONE) {
+      sendDeletedDoneEvent(evt.face_id,evt.step==1);
+      continue;
+    }
+    // A committed enrollment remains real even if a later command changed epoch.
+    // Report its ID, without cancelling any newer enrollment session.
+    if(evt.type == AI_EVT_ENROLL_FINISHED && evt.epoch != authEpoch.load()) {
+      sendEnrollDoneEvent(evt.face_id);
+      continue;
+    }
+    if(evt.epoch != authEpoch.load()) continue;
+    switch(evt.type) {
       case AI_EVT_AUTH_SUCCESS:
-        // Xác thực khuôn mặt thành công: kích hoạt thời gian ân hạn mở cửa
-        isAuthenticated = true;
-        authSuccessMillis = millis();
-        triggerBuzzerPattern(1, 100, 100); // 1 beep ngắn xác thực
+        if(evt.face_id>0 && aiReady && !deletePending && !isEnrolling && !isAuthenticated &&
+           currentMode!=MODE_DISARMED && uint32_t(millis()-evt.frameMillis)<=FacePolicy::FRAME_MAX_AGE_MS) {
+          isAuthenticated=true; authSuccessMillis=millis();
+          triggerBuzzerPattern(1,100,100);
+          Serial.printf("[AUTH] VERIFIED person=%d\n",evt.face_id);
+          statusPublishPending=true;
+          sendAuthEvent(evt.face_id);
+        }
         break;
-
       case AI_EVT_ENROLL_STEP_OK:
-        if (evt.step == 1) {
-          triggerBuzzerPattern(1, 150, 150); // 1 tiếng beep góc 1 (Trực diện)
-          sendEnrollStepEvent(1, "FRONT");
-        } else if (evt.step == 2) {
-          triggerBuzzerPattern(2, 120, 120); // 2 tiếng beep góc 2 (Nghiêng 1)
-          sendEnrollStepEvent(2, "YAW_1");
-        } else if (evt.step == 3) {
-          triggerBuzzerPattern(3, 120, 120); // 3 tiếng beep góc 3 (Nghiêng 2)
-          sendEnrollStepEvent(3, "YAW_2");
+        {
+          enrollStep=evt.step;
+          triggerBuzzerPattern(evt.step,120,120);
+          sendEnrollStepEvent(evt.step,evt.step==1?"FRONT":(evt.step==2?"YAW_1":"YAW_2"));
         }
         break;
-
       case AI_EVT_ENROLL_FINISHED:
-        // Còi phát 1 tiếng beep dài (~500ms), kết thúc nạp mặt
-        triggerBuzzerPattern(1, 500, 50);
-        if (xSemaphoreTake(sharedStateMutex, (TickType_t)10) == pdTRUE) {
-          isEnrolling = false;
-          enrollStep = 0;
-          xSemaphoreGive(sharedStateMutex);
-        }
-        sendEnrollDoneEvent(evt.face_id);
+        isEnrolling=false;enrollStep=0;
+        triggerBuzzerPattern(1,500,50);sendEnrollDoneEvent(evt.face_id);
         break;
-
-      default:
+      case AI_EVT_ENROLL_FAILED: {
+        isEnrolling=false;enrollStep=0;triggerBuzzerPattern(3,80,80);
+        StaticJsonDocument<160> reply;
+        reply["status"]="FAILED";reply["reason"]=evt.reason;reply["face_id"]=evt.face_id;
+        char buf[160];serializeJson(reply,buf);mqttClient.publish(topic_event_enroll_done,buf);
+        Serial.printf("[ENROLL] FAILED: %s\n",evt.reason);
         break;
+      }
+      default: break;
     }
   }
 
@@ -1069,6 +848,7 @@ void loop() {
 
     // Nếu cửa đóng lại: reset cờ chụp ảnh và khóa an ninh nếu trước đó mở hợp lệ
     if (!isDoorOpen) {
+      ++authEpoch;
       breachSnapshotTaken = false; // Cho phép chụp lại khi có lần mở cửa tiếp theo
       if (isAuthenticated) {
         isAuthenticated = false;
@@ -1168,12 +948,23 @@ void loop() {
   // Xử lý nạp OTA
   ArduinoOTA.handle();
 
-  // Quản lý kết nối MQTT (Core 0)
+  // Quản lý kết nối Mạng & Tự động tìm kiếm Server ngầm nếu chưa có
   if (WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) {
-      tryReconnectMQTT();
+    if (strlen(serverIP) == 0) {
+      static unsigned long lastDiscRetry = 0;
+      if (millis() - lastDiscRetry >= 4000) {
+        lastDiscRetry = millis();
+        if (discoverServerIP(3000)) {
+          initNetworkClients();
+        }
+      }
     } else {
-      mqttClient.loop();
+      if(!networkClientsConfigured) initNetworkClients();
+      if (!mqttClient.connected()) {
+        tryReconnectMQTT();
+      } else {
+        mqttClient.loop();
+      }
     }
 
     // Gửi phản hồi MQTT an toàn ngoài loop() (Tránh deadlock/corrupt buffer trong callback)
@@ -1183,7 +974,7 @@ void loop() {
     }
     if (deleteDoneEventPending && mqttClient.connected()) {
       deleteDoneEventPending = false;
-      sendDeletedDoneEvent(deleteDoneFaceId, deleteDoneResult);
+      sendDeletedDoneEvent(deleteDoneFaceId.load(), deleteDoneResult.load());
     }
   }
 

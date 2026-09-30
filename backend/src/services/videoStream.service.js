@@ -74,21 +74,37 @@ class VideoStreamService {
         console.log('📷 [Stream] ESP32 Camera sender connected');
         this.esp32CameraWs = ws;
 
+        let frameCount = 0;
+        let droppedCount = 0;
+        const statInterval = setInterval(() => {
+          if (frameCount > 0 || droppedCount > 0) {
+            console.log(`[Stream Stats] Received from ESP32: ${frameCount} FPS | Dropped: ${droppedCount} | Viewers: ${this.viewers.size}`);
+            frameCount = 0;
+            droppedCount = 0;
+          }
+        }, 1000);
+
         ws.on('message', (data, isBinary) => {
           if (!isBinary) return;
+          frameCount++;
 
           // Lưu frame đệm tạm thời trong RAM (Zero-Copy relay, không ghi đĩa)
           this.lastFrame = data;
 
           // Chuyển tiếp tức thì mảng byte JPEG Grayscale đến tất cả Active Viewers (độ trễ <= 125ms)
           for (const viewer of this.viewers) {
-            if (viewer.readyState === viewer.OPEN && viewer.bufferedAmount === 0) {
-              viewer.send(data, { binary: true });
+            if (viewer.readyState === viewer.OPEN) {
+              if (viewer.bufferedAmount < 65536) {
+                viewer.send(data, { binary: true });
+              } else {
+                droppedCount++;
+              }
             }
           }
         });
 
         ws.on('close', () => {
+          clearInterval(statInterval);
           console.warn('⚠️ [Stream] ESP32 Camera sender disconnected');
           this.esp32CameraWs = null;
         });
@@ -107,6 +123,7 @@ class VideoStreamService {
 
       const onStatus = (data) => sendJson('DEVICE_STATUS', data);
       const onDoor = (data) => sendJson('DOOR_EVENT', data);
+      const onAuth = (data) => sendJson('FACE_AUTH_EVENT', data);
       const onAlarm = (data) => sendJson('ALARM_BREACH', data);
       const onEnrollStep = (data) => sendJson('ENROLL_STEP', data);
       const onEnrollDone = (data) => sendJson('ENROLL_DONE', data);
@@ -114,6 +131,7 @@ class VideoStreamService {
 
       mqttGateway.on('device_status', onStatus);
       mqttGateway.on('door_event', onDoor);
+      mqttGateway.on('auth_event', onAuth);
       mqttGateway.on('alarm_event', onAlarm);
       mqttGateway.on('enroll_step', onEnrollStep);
       mqttGateway.on('enroll_done', onEnrollDone);
@@ -122,6 +140,7 @@ class VideoStreamService {
       ws.on('close', () => {
         mqttGateway.off('device_status', onStatus);
         mqttGateway.off('door_event', onDoor);
+        mqttGateway.off('auth_event', onAuth);
         mqttGateway.off('alarm_event', onAlarm);
         mqttGateway.off('enroll_step', onEnrollStep);
         mqttGateway.off('enroll_done', onEnrollDone);

@@ -7,10 +7,16 @@ const videoStreamService = require('../services/videoStream.service');
 // Lấy danh sách nhật ký ra vào
 exports.getAccessLogs = async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = parseInt(req.query.limit) || 100;
     const logs = await AccessLog.findAll({
       order: [['timestamp', 'DESC']],
-      limit
+      limit,
+      include: [{
+        model: Face,
+        as: 'face',
+        required: false,
+        attributes: ['id', 'face_id', 'name', 'role_type', 'is_active']
+      }]
     });
     res.json({ success: true, logs });
   } catch (err) {

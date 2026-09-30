@@ -81,6 +81,10 @@ exports.toggleFaceActive = async (req, res) => {
     face.is_active = typeof req.body.is_active === 'boolean' ? req.body.is_active : !face.is_active;
     await face.save();
 
+    // Đồng bộ ngay lập tức trạng thái Active / Inactive xuống ESP32
+    console.log(`Sending MQTT toggle command for face #${faceId}: ${face.is_active ? 'ACTIVE' : 'INACTIVE'}`);
+    mqttGateway.sendToggleFaceCommand(faceId, face.is_active);
+
     res.json({
       success: true,
       message: `Face #${faceId} is now ${face.is_active ? 'ACTIVE' : 'INACTIVE'}`,

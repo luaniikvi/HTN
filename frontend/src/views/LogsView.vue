@@ -22,6 +22,16 @@
         <div class="tabs-list">
           <button
             class="tab-item"
+            :class="{ active: activeTab === 'authorize' }"
+            @click="activeTab = 'authorize'"
+          >
+            <UserCheck :size="15" />
+            <span>Authorize History</span>
+            <span v-if="authLogs.length > 0" class="count-pill green">{{ authLogs.length }}</span>
+          </button>
+
+          <button
+            class="tab-item"
             :class="{ active: activeTab === 'access' }"
             @click="activeTab = 'access'"
           >
@@ -52,8 +62,57 @@
         </div>
       </div>
 
+      <!-- Tab 0: Authorize History Table -->
+      <div v-if="activeTab === 'authorize'" class="tab-pane">
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Face ID</th>
+                <th>Subject Name</th>
+                <th>Access Tier</th>
+                <th>Result</th>
+                <th>Log Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="authLogs.length === 0">
+                <td colspan="6" class="empty-cell">No facial authorization events recorded yet.</td>
+              </tr>
+              <tr v-for="log in authLogs" :key="log.id">
+                <td class="font-mono text-muted text-xs">{{ formatTime(log.timestamp) }}</td>
+                <td class="font-mono font-bold text-xs">#{{ log.face_id || '—' }}</td>
+                <td>
+                  <div class="subject-cell">
+                    <div class="avatar-sm">
+                      {{ (log.face?.name || extractNameFromDetails(log.details) || 'U').charAt(0).toUpperCase() }}
+                    </div>
+                    <span class="subject-name font-bold">{{ log.face?.name || extractNameFromDetails(log.details) || ('Face #' + log.face_id) }}</span>
+                  </div>
+                </td>
+                <td>
+                  <span
+                    class="badge"
+                    :class="log.face?.role_type === 'PERMANENT' ? 'badge-disarmed' : (log.face?.role_type === 'TEMPORARY' ? 'badge-stay' : 'badge-offline')"
+                  >
+                    {{ log.face?.role_type || 'REGISTERED' }}
+                  </span>
+                </td>
+                <td>
+                  <span class="badge badge-disarmed">
+                    ✓ VERIFIED
+                  </span>
+                </td>
+                <td class="details-cell">{{ log.details }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Tab 1: Access History Table -->
-      <div v-if="activeTab === 'access'" class="tab-pane">
+      <div v-else-if="activeTab === 'access'" class="tab-pane">
         <div class="table-responsive">
           <table class="data-table">
             <thead>
@@ -227,6 +286,7 @@ import api from '../api/client';
 import {
   RefreshCw,
   Clock,
+  UserCheck,
   AlertTriangle,
   Camera,
   ZoomIn,
@@ -235,7 +295,7 @@ import {
   ExternalLink
 } from 'lucide-vue-next';
 
-const activeTab = ref('gallery');
+const activeTab = ref('authorize');
 const accessLogs = ref([]);
 const alarmLogs = ref([]);
 const isLoading = ref(false);
@@ -244,6 +304,16 @@ const selectedLog = ref(null);
 const breachImages = computed(() => {
   return alarmLogs.value.filter(log => Boolean(log.image_url));
 });
+
+const authLogs = computed(() => {
+  return accessLogs.value.filter(log => log.event_type === 'FACE_AUTH_SUCCESS');
+});
+
+function extractNameFromDetails(details) {
+  if (!details) return '';
+  const m = details.match(/(?:thành công:\s*|verified:\s*)([^(]+)/i);
+  return m ? m[1].trim() : '';
+}
 
 function openLightbox(log) {
   selectedLog.value = log;
@@ -278,7 +348,7 @@ async function fetchAlarmLogs() {
 }
 
 function fetchCurrentTabLogs() {
-  if (activeTab.value === 'access') fetchAccessLogs();
+  if (activeTab.value === 'access' || activeTab.value === 'authorize') fetchAccessLogs();
   else fetchAlarmLogs();
 }
 
@@ -295,13 +365,13 @@ function formatTime(iso) {
 }
 
 watch(activeTab, (tab) => {
-  if (tab === 'access' && accessLogs.value.length === 0) fetchAccessLogs();
+  if ((tab === 'access' || tab === 'authorize') && accessLogs.value.length === 0) fetchAccessLogs();
   if ((tab === 'alarms' || tab === 'gallery') && alarmLogs.value.length === 0) fetchAlarmLogs();
 });
 
 onMounted(() => {
-  fetchAlarmLogs();
   fetchAccessLogs();
+  fetchAlarmLogs();
 });
 </script>
 
@@ -399,6 +469,36 @@ onMounted(() => {
 .count-pill.blue {
   background: var(--color-primary-subtle);
   color: var(--color-primary);
+}
+
+.count-pill.green {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.subject-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.avatar-sm {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #eff6ff;
+  color: #2563eb;
+  font-size: 0.725rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #bfdbfe;
+}
+
+.subject-name {
+  font-weight: 600;
+  color: var(--text-main);
 }
 
 /* Tab Content */

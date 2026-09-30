@@ -36,6 +36,7 @@ services:
     ports:
       - "3000:3000"
       - "3443:3443"
+      - "8888:8888/udp"
     environment:
       PORT_HTTP: 3000
       PORT_HTTPS: 3443

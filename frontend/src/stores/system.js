@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia';
 import api from '../api/client';
+import { useNotifyStore } from './notify';
 
 export const useSystemStore = defineStore('system', {
   state: () => ({
@@ -135,8 +136,22 @@ export const useSystemStore = defineStore('system', {
             this.enrollStep = payload.step;
             this.enrollStepData = payload;
           } else if (type === 'ENROLL_DONE') {
-            this.enrolledFaceId = payload.faceId;
-            this.enrollStep = 4; // Hoàn tất
+            if (payload.status === 'SUCCESS') {
+              this.enrolledFaceId = payload.faceId;
+              this.enrollStep = 4; // Hoan tat thanh cong -> dien thong tin luu
+            } else {
+              this.enrollStep = 0;
+              this.enrolledFaceId = null;
+              const notify = useNotifyStore();
+              const reasonMap = {
+                'TIMEOUT': 'Qua thoi gian cho (Timeout) - khong thu nhan du mau khuon mat.',
+                'ALREADY_ENROLLED': 'Khuon mat nay da duoc dang ky trong he thong!',
+                'FULL_10_PEOPLE': 'Bo nho da day (Toi da 10 nguoi)!',
+                'AI_NOT_READY': 'Mo hinh AI tren ESP32 chua san sang.'
+              };
+              const reasonMsg = reasonMap[payload.reason] || payload.reason || 'Dang ky khong thanh cong.';
+              notify.error(reasonMsg, 'Dang ky that bai');
+            }
           }
         } catch (err) {
           console.error('Error parsing event message:', err);
