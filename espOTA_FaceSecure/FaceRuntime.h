@@ -106,11 +106,11 @@ static void inferenceTask(void *) {
     if(enrolling && isEnrolling) {
       if(session!=frameEpoch) {session=frameEpoch;started=millis();step=stable=side=0;lastSample=0;}
       bool pose=step==0 ? fabsf(engine->yaw)<=0.14f :
-        (step==1 ? fabsf(engine->yaw)>=0.06f && fabsf(engine->yaw)<=0.42f :
-          engine->yaw*side<=-0.06f && fabsf(engine->yaw)<=0.42f);
+        (step==1 ? fabsf(engine->yaw)>=0.05f && fabsf(engine->yaw)<=0.42f :
+          engine->yaw*side<=-0.05f && fabsf(engine->yaw)<=0.42f);
       bool same=true;
       for(int i=0;i<step;++i) if(FacePolicy::dot(staged[i],embedding)<FacePolicy::ENROLL_CONSISTENCY) same=false;
-      if(!pose || !same || (step>0 && millis()-lastSample<500)) {
+      if(!pose || !same || (step>0 && millis()-lastSample<400)) {
         stable=0;
         if(millis()-lastLog>1000) {lastLog=millis();Serial.printf("[ENROLL] waiting step=%d yaw=%.2f same=%d\n",step+1,engine->yaw,same);}
       } else {
