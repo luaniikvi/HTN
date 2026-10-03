@@ -23,6 +23,12 @@
 #include <freertos/semphr.h>
 #include <HTTPClient.h>
 
+#if ENABLE_BLE_FALLBACK
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_gap_ble_api.h>
+#endif
+
 // =================================================================================================
 // 1. ĐỊNH NGHĨA CHÂN NGOẠI VI THEO CỤM TỐI ƯU (KHÔNG XUNG ĐỘT CAMERA & PSRAM)
 // =================================================================================================
@@ -286,6 +292,189 @@ SystemMode readSwitchModeWithDebounce() {
   return stableMode;
 }
 
+// Hàm chuyển chế độ an ninh dùng chung cho cả MQTT và BLE Fallback
+bool applySystemModeChange(SystemMode newMode, const char* source) {
+  if (xSemaphoreTake(sharedStateMutex, (TickType_t)20) == pdTRUE) {
+    if (newMode != currentMode) {
+      ++authEpoch;
+      isEnrolling = false; enrollStep = 0;
+      currentMode = newMode;
+      isAuthenticated = false; // Reset xác thực ngay khi chuyển chế độ
+      authSuccessMillis = 0;
+      armedAlarmLatched = false; // Reset chốt còi báo động
+      if (currentMode == MODE_DISARMED) {
+        forcedAlarm = false;
+      }
+      triggerBuzzerPattern(1, 150, 100); // Beep 1 lần phản hồi chuyển chế độ
+      statusPublishPending = true; // Gửi trạng thái qua MQTT nếu có kết nối
+      const char* modeStr = (newMode == MODE_ARMED) ? "ARMED" : (newMode == MODE_STAY) ? "STAY" : "DISARMED";
+      Serial.printf("[MODE] 🔄 Đã đổi chế độ an ninh sang: %s (Nguồn: %s)\n", modeStr, source);
+    }
+    xSemaphoreGive(sharedStateMutex);
+    return true;
+  }
+  return false;
+}
+
+#if ENABLE_BLE_FALLBACK
+// =================================================================================================
+// CẤU HÌNH & XỬ LÝ BLUETOOTH DỰ PHÒNG (BLE iBeacon Scanner)
+// =================================================================================================
+static bool bleActive = false;
+static unsigned long lastBleScanRestart = 0;
+
+static uint8_t blePatternDisarmed[32];
+static size_t  bleLenDisarmed = 0;
+static uint8_t blePatternArmed[32];
+static size_t  bleLenArmed = 0;
+static uint8_t blePatternStay[32];
+static size_t  bleLenStay = 0;
+static bool    blePatternsInit = false;
+
+static size_t hexToBytes(const char* hex, uint8_t* out, size_t maxLen) {
+  size_t hexLen = strlen(hex);
+  size_t bytes = 0;
+  for (size_t i = 0; i + 1 < hexLen && bytes < maxLen; i += 2) {
+    char byteStr[3] = { hex[i], hex[i + 1], '\0' };
+    out[bytes++] = (uint8_t)strtoul(byteStr, NULL, 16);
+  }
+  return bytes;
+}
+
+static void initBlePatterns() {
+  if (blePatternsInit) return;
+  bleLenDisarmed = hexToBytes(DISARMED_BLE_HEX, blePatternDisarmed, sizeof(blePatternDisarmed));
+  bleLenArmed    = hexToBytes(ARMED_BLE_HEX, blePatternArmed, sizeof(blePatternArmed));
+  bleLenStay     = hexToBytes(STAY_BLE_HEX, blePatternStay, sizeof(blePatternStay));
+  blePatternsInit = true;
+}
+
+static esp_ble_scan_params_t ble_scan_params = {
+  .scan_type              = BLE_SCAN_TYPE_ACTIVE,
+  .own_addr_type          = BLE_ADDR_TYPE_PUBLIC,
+  .scan_filter_policy     = BLE_SCAN_FILTER_ALLOW_ALL,
+  .scan_interval          = 0x50, // 50ms
+  .scan_window            = 0x30, // 30ms (tiết kiệm CPU)
+  .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE
+};
+
+static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+  if (event == ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT) {
+    esp_ble_gap_start_scanning(30);
+  } else if (event == ESP_GAP_BLE_SCAN_RESULT_EVT) {
+    esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
+    if (scan_result->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
+      uint8_t *adv_data = scan_result->scan_rst.ble_adv;
+      uint8_t adv_data_len = scan_result->scan_rst.adv_data_len;
+
+      initBlePatterns();
+
+      static unsigned long lastBleCmdMillis = 0;
+      if (millis() - lastBleCmdMillis < 1500) return; // Chống lặp lệnh trong 1.5s
+
+      for (uint8_t i = 0; i < adv_data_len; i++) {
+        // So khớp với mẫu DISARMED_BLE_HEX (so sánh 22 byte cấu trúc: prefix + UUID + Major + Minor)
+        size_t lenDis = (bleLenDisarmed >= 22) ? 22 : bleLenDisarmed;
+        if (lenDis > 0 && i + lenDis <= adv_data_len && memcmp(adv_data + i, blePatternDisarmed, lenDis) == 0) {
+          lastBleCmdMillis = millis();
+          if (BLE_DEBUG) {
+            Serial.printf("[BLE] 📡 Nhận gói tin khớp DISARMED_BLE_HEX (RSSI: %d dBm)\n", scan_result->scan_rst.rssi);
+          }
+          applySystemModeChange(MODE_DISARMED, "BLE iBeacon");
+          break;
+        }
+
+        // So khớp với mẫu ARMED_BLE_HEX
+        size_t lenArm = (bleLenArmed >= 22) ? 22 : bleLenArmed;
+        if (lenArm > 0 && i + lenArm <= adv_data_len && memcmp(adv_data + i, blePatternArmed, lenArm) == 0) {
+          lastBleCmdMillis = millis();
+          if (BLE_DEBUG) {
+            Serial.printf("[BLE] 📡 Nhận gói tin khớp ARMED_BLE_HEX (RSSI: %d dBm)\n", scan_result->scan_rst.rssi);
+          }
+          applySystemModeChange(MODE_ARMED, "BLE iBeacon");
+          break;
+        }
+
+        // So khớp với mẫu STAY_BLE_HEX
+        size_t lenStay = (bleLenStay >= 22) ? 22 : bleLenStay;
+        if (lenStay > 0 && i + lenStay <= adv_data_len && memcmp(adv_data + i, blePatternStay, lenStay) == 0) {
+          lastBleCmdMillis = millis();
+          if (BLE_DEBUG) {
+            Serial.printf("[BLE] 📡 Nhận gói tin khớp STAY_BLE_HEX (RSSI: %d dBm)\n", scan_result->scan_rst.rssi);
+          }
+          applySystemModeChange(MODE_STAY, "BLE iBeacon");
+          break;
+        }
+      }
+    }
+  }
+}
+
+void handleBleFallback(bool enableLocalBle) {
+  if (enableLocalBle && !bleActive) {
+    initBlePatterns();
+    // Chỉ bật BLE nếu còn đủ bộ nhớ RAM cho Bluedroid (~60KB)
+    if (ESP.getFreeHeap() < 65000) {
+      if (BLE_DEBUG) {
+        Serial.printf("[BLE] ⚠️ Heap quá thấp (%d bytes), hoãn bật BLE dự phòng để tránh tràn RAM!\n", ESP.getFreeHeap());
+      }
+      return;
+    }
+
+    if (BLE_DEBUG) {
+      Serial.printf("[BLE] 🚀 Bật kênh BLE iBeacon dự phòng (Free Heap: %d bytes)...\n", ESP.getFreeHeap());
+      Serial.printf("[BLE] -> Mẫu DISARMED: %s\n", DISARMED_BLE_HEX);
+      Serial.printf("[BLE] -> Mẫu ARMED:    %s\n", ARMED_BLE_HEX);
+      Serial.printf("[BLE] -> Mẫu STAY:     %s\n", STAY_BLE_HEX);
+    }
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    if (esp_bt_controller_init(&bt_cfg) == ESP_OK) {
+      if (esp_bt_controller_enable(ESP_BT_MODE_BLE) == ESP_OK) {
+        if (esp_bluedroid_init() == ESP_OK && esp_bluedroid_enable() == ESP_OK) {
+          esp_ble_gap_register_callback(esp_gap_cb);
+          esp_ble_gap_set_scan_params(&ble_scan_params);
+          bleActive = true;
+          lastBleScanRestart = millis();
+          if (BLE_DEBUG) {
+            Serial.printf("[BLE] ✅ BLE Scanner đã sẵn sàng nhận lệnh! (Free Heap: %d bytes)\n", ESP.getFreeHeap());
+          }
+          return;
+        }
+      }
+    }
+    // Nếu khởi tạo lỗi, giải phóng
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    bleActive = false;
+  }
+  else if (!enableLocalBle && bleActive) {
+    if (BLE_DEBUG) {
+      Serial.println("[BLE] 🛑 Tắt BLE dự phòng, ưu tiên Wi-Fi/Server & hoàn trả 100% RAM...");
+    }
+    esp_ble_gap_stop_scanning();
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    bleActive = false;
+    if (BLE_DEBUG) {
+      Serial.printf("[BLE] ✅ Đã đóng BLE hoàn toàn. Free Heap phục hồi: %d bytes\n", ESP.getFreeHeap());
+    }
+  }
+  else if (bleActive) {
+    // Định kỳ khởi động lại lượt quét 30s để duy trì lắng nghe liên tục
+    if (millis() - lastBleScanRestart >= 30000) {
+      lastBleScanRestart = millis();
+      esp_ble_gap_start_scanning(30);
+    }
+  }
+}
+#endif
+
+
 // =================================================================================================
 // 5. CẤU HÌNH CAMERA OV5640 (QVGA 320x240 - SINGLE-CHANNEL GRAYSCALE JPEG)
 // =================================================================================================
@@ -494,31 +683,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Lệnh đồng bộ chế độ an ninh
   if (strcmp(topic, topic_cmd_mode) == 0) {
     const char* mode = doc["mode"] | "";
-    if (xSemaphoreTake(sharedStateMutex, (TickType_t)10) == pdTRUE) {
-      SystemMode newMode = currentMode.load();
-      if (strcmp(mode, "ARMED") == 0) {
-        newMode = MODE_ARMED;
-      } else if (strcmp(mode, "STAY") == 0) {
-        newMode = MODE_STAY;
-      } else if (strcmp(mode, "DISARMED") == 0) {
-        newMode = MODE_DISARMED;
-      }
-
-      if (newMode != currentMode) {
-        ++authEpoch;
-        isEnrolling = false; enrollStep = 0;
-        currentMode = newMode;
-        isAuthenticated = false; // Reset xác thực ngay khi chuyển chế độ
-        authSuccessMillis = 0;
-        armedAlarmLatched = false; // Reset chốt còi báo động khi chuyển sang bất kỳ chế độ nào
-        if (currentMode == MODE_DISARMED) {
-          forcedAlarm = false;
-        }
-        triggerBuzzerPattern(1, 150, 100); // Beep 1 lần phản hồi chuyển chế độ
-        statusPublishPending = true; // Gửi trạng thái an toàn ngoài loop()
-      }
-      xSemaphoreGive(sharedStateMutex);
+    SystemMode newMode = currentMode.load();
+    if (strcmp(mode, "ARMED") == 0) {
+      newMode = MODE_ARMED;
+    } else if (strcmp(mode, "STAY") == 0) {
+      newMode = MODE_STAY;
+    } else if (strcmp(mode, "DISARMED") == 0) {
+      newMode = MODE_DISARMED;
     }
+    applySystemModeChange(newMode, "MQTT");
   }
   // Lệnh bắt đầu hoặc hủy quy trình nạp khuôn mặt
   else if (strcmp(topic, topic_cmd_enroll) == 0) {
@@ -1033,6 +1206,23 @@ void loop() {
       Serial.printf("[NET-DIAG] ❌ WiFi: DISCONNECTED! Status code: %d. Đang thử kết nối lại...\n", WiFi.status());
     }
   }
+
+#if ENABLE_BLE_FALLBACK
+  // 7. Quản lý kênh BLE iBeacon dự phòng:
+  // - Nếu Wi-Fi mất kết nối HOẶC Server/MQTT mất kết nối >= 10s: Kích hoạt BLE Scanner.
+  // - Nếu Wi-Fi & Server/MQTT đã kết nối tốt: Đóng hoàn toàn BLE để giải phóng RAM & băng thông RF cho Camera/AI.
+  static unsigned long serverDisconnectedSince = 0;
+  bool isServerConnected = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
+
+  if (isServerConnected) {
+    serverDisconnectedSince = 0;
+  } else if (serverDisconnectedSince == 0) {
+    serverDisconnectedSince = millis();
+  }
+
+  bool shouldEnableBle = (!isServerConnected && (WiFi.status() != WL_CONNECTED || (millis() - serverDisconnectedSince >= 10000)));
+  handleBleFallback(shouldEnableBle);
+#endif
 
   vTaskDelay(pdMS_TO_TICKS(2)); // Nhường nhẹ CPU
 }

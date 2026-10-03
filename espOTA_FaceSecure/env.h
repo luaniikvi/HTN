@@ -29,6 +29,17 @@
 #define WS_DEBUG                true     // In log sự kiện kết nối WebSocket camera stream [WS CAMERA]
 #define PERF_DEBUG              false     // In log hiệu năng FPS, băng thông mạng và RAM định kỳ [PERF]
 #define FACE_DEBUG              true     // In log chi tiết phát hiện và nhận diện khuôn mặt [FACE]
+#define BLE_DEBUG               true     // In log trạng thái bật/tắt và nhận diện gói tin BLE iBeacon
 
 // 5. CẤU HÌNH DEMO / KIỂM THỬ CẢM BIẾN CỬA
 #define ALWAYS_DOOR_CLOSE_DEMO  true     // true: Giả lập cửa luôn đóng; false: Đọc cảm biến thật MC-38 (chân 21)
+
+// 6. CẤU HÌNH BLUETOOTH DỰ PHÒNG (BLE iBeacon Fallback)
+#define ENABLE_BLE_FALLBACK     true     // Bật BLE dự phòng khi mất kết nối Wi-Fi hoặc Server
+#define DISARMED_BLE_HEX        "0215fda50693a4e24fb1afcfc6eb07647825000a0001c5"
+#define ARMED_BLE_HEX           "0215fda50693a4e24fb1afcfc6eb07647825000a0002c5"
+#define STAY_BLE_HEX            "0215fda50693a4e24fb1afcfc6eb07647825000a0003c5"
+
+
+
+
