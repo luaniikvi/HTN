@@ -49,7 +49,9 @@ class MqttGateway extends EventEmitter {
       'device/+/events/alarm',
       'device/+/events/enroll_step',
       'device/+/events/enroll_done',
-      'device/+/events/deleted_done'
+      'device/+/events/deleted_done',
+      'device/+/events/config',
+      'device/+/events/faces'
     ];
 
     this.client.subscribe(topics, { qos: 1 }, (err) => {
@@ -72,6 +74,8 @@ class MqttGateway extends EventEmitter {
         const doorState = payload.door || 'CLOSED';
         const securityMode = payload.mode || 'DISARMED';
 
+        const gracePeriod = payload.grace_period ? parseInt(payload.grace_period) : null;
+
         const updateData = {
           device_id: deviceId,
           status: status,
@@ -80,22 +84,43 @@ class MqttGateway extends EventEmitter {
           last_heartbeat: new Date()
         };
 
-        if (securityMode === 'DISARMED') {
-          updateData.forced_alarm = false;
+        if (gracePeriod && gracePeriod >= 3 && gracePeriod <= 60) {
+          updateData.grace_period = gracePeriod;
+        }
+
+        if (payload.alarm !== undefined) {
+          updateData.forced_alarm = Boolean(payload.alarm);
+        } else if (securityMode === 'DISARMED') {
           updateData.armed_latched = false;
         }
 
         await SystemState.upsert(updateData);
 
         if (status === 'ONLINE') {
-          Face.findAll({ where: { is_active: false } }).then(inactiveFaces => {
-            for (const f of inactiveFaces) {
-              this.sendToggleFaceCommand(f.face_id, false, deviceId);
+          Face.findAll().then(faces => {
+            for (const f of faces) {
+              if (!f.is_active) {
+                this.sendToggleFaceCommand(f.face_id, false, deviceId);
+              }
+              this.sendUpdateFaceMetaCommand({
+                face_id: f.face_id,
+                name: f.name || `Person #${f.face_id}`,
+                role_type: f.role_type || 'PERMANENT',
+                valid_until: f.valid_until ? f.valid_until.toISOString() : '',
+                is_active: f.is_active
+              }, deviceId);
             }
-          }).catch(err => console.warn('Could not sync inactive faces:', err.message));
+          }).catch(err => console.warn('Could not sync faces to device:', err.message));
         }
 
-        this.emit('device_status', { deviceId, status, doorState, securityMode });
+        this.emit('device_status', {
+          deviceId,
+          status,
+          doorState,
+          securityMode,
+          gracePeriod: updateData.grace_period,
+          alarm: payload.alarm !== undefined ? Boolean(payload.alarm) : updateData.forced_alarm
+        });
       }
 
       // 2. device/{id}/events/door
@@ -204,18 +229,76 @@ class MqttGateway extends EventEmitter {
 
         this.emit('deleted_done', { deviceId, faceId, status });
       }
+
+      // 7. device/{id}/events/config
+      else if (subType === 'events' && eventType === 'config') {
+        const gracePeriod = parseInt(payload.grace_period);
+        if (gracePeriod && gracePeriod >= 3 && gracePeriod <= 60) {
+          await SystemState.update(
+            { grace_period: gracePeriod, last_heartbeat: new Date() },
+            { where: { device_id: deviceId } }
+          );
+          console.log(`[MQTT] ⏱️ Synced grace_period (${gracePeriod}s) from device ${deviceId} to DB`);
+          this.emit('device_status', { deviceId, gracePeriod });
+        }
+      }
+
+      // 8. device/{id}/events/faces (Đồng bộ danh sách khuôn mặt từ Flash MCU)
+      else if (subType === 'events' && eventType === 'faces') {
+        const facesList = Array.isArray(payload.faces) ? payload.faces : [];
+        console.log(`[MQTT] 👥 Received faces sync from device ${deviceId}: ${facesList.length} faces`);
+
+        let anyChanged = false;
+        for (const item of facesList) {
+          const fid = parseInt(item.face_id);
+          if (!fid || isNaN(fid)) continue;
+
+          const targetName = (item.name && item.name.trim()) ? item.name.trim() : `Person #${fid}`;
+          const targetRole = (item.role_type === 'TEMPORARY') ? 'TEMPORARY' : 'PERMANENT';
+          const targetValid = (targetRole === 'TEMPORARY' && item.valid_until) ? new Date(item.valid_until) : null;
+          const targetActive = item.is_active !== false;
+
+          const existing = await Face.findOne({ where: { face_id: fid } });
+          if (!existing) {
+            // DB bị reset hoặc thiếu khuôn mặt -> Tự động khôi phục vào CSDL với đầy đủ thông tin!
+            await Face.create({
+              face_id: fid,
+              name: targetName,
+              role_type: targetRole,
+              valid_until: targetValid,
+              is_active: targetActive
+            });
+            anyChanged = true;
+            console.log(`[FACE SYNC] ➕ Auto-restored Face ID ${fid} (${targetName}, ${targetRole}) into database`);
+          } else {
+            // Cập nhật nếu có trường thay đổi
+            const updateFields = {
+              is_active: targetActive,
+              role_type: existing.role_type || targetRole,
+              valid_until: existing.valid_until || targetValid
+            };
+            if (targetName && targetName !== `Person #${fid}`) {
+              updateFields.name = targetName;
+            }
+            await existing.update(updateFields);
+            anyChanged = true;
+          }
+        }
+
+        this.emit('faces_sync', { deviceId, count: facesList.length, changed: anyChanged });
+      }
     } catch (err) {
       console.error('Error handling MQTT message:', err.message);
     }
   }
 
   // --- HÀM PHÁT LỆNH ĐIỀU KHIỂN XUỐNG ESP32 (QoS 1) ---
-  publishCommand(topic, data) {
+  publishCommand(topic, data, options = { qos: 1 }) {
     if (!this.client || !this.client.connected) {
       console.warn(`Cannot publish to ${topic}: MQTT client disconnected`);
       return false;
     }
-    this.client.publish(topic, JSON.stringify(data), { qos: 1 });
+    this.client.publish(topic, JSON.stringify(data), options);
     return true;
   }
 
@@ -248,11 +331,15 @@ class MqttGateway extends EventEmitter {
   }
 
   sendConfigCommand(gracePeriod, deviceId = this.deviceId) {
-    return this.publishCommand(`device/${deviceId}/cmd/config`, { grace_period: gracePeriod });
+    return this.publishCommand(`device/${deviceId}/cmd/config`, { grace_period: gracePeriod }, { qos: 1, retain: true });
   }
 
   sendToggleFaceCommand(faceId, active, deviceId = this.deviceId) {
     return this.publishCommand(`device/${deviceId}/cmd/toggle_face`, { face_id: faceId, active });
+  }
+
+  sendUpdateFaceMetaCommand(faceData, deviceId = this.deviceId) {
+    return this.publishCommand(`device/${deviceId}/cmd/update_face_meta`, faceData, { qos: 1, retain: true });
   }
 }
 

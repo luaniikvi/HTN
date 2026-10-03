@@ -187,7 +187,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import { useSystemStore } from '../stores/system';
 import { useNotifyStore } from '../stores/notify';
 import { MorphIcon } from 'morphicons/vue';
@@ -209,14 +209,20 @@ const notify = useNotifyStore();
 const isDeviceReady = computed(() => system.isOnline);
 const isSubmitting = ref(false);
 const graceInput = ref(system.gracePeriod || 10);
+watch(() => system.gracePeriod, (newVal) => {
+  if (newVal) graceInput.value = newVal;
+});
 const saveMessage = ref('');
 
 const isAlarmActive = computed(() => {
-  if (system.securityMode === 'DISARMED') return false;
+  if (system.forcedAlarm) return true;
   if (system.securityMode === 'STAY') {
-    return Boolean(system.forcedAlarm || (system.doorState === 'OPEN' && (system.armedLatched || system.activeBreachAlert)));
+    return Boolean(system.doorState === 'OPEN' && (system.armedLatched || system.activeBreachAlert));
   }
-  return Boolean(system.forcedAlarm || system.armedLatched);
+  if (system.securityMode === 'ARMED') {
+    return Boolean(system.armedLatched || system.activeBreachAlert);
+  }
+  return false;
 });
 
 async function selectMode(mode) {

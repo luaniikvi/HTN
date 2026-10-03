@@ -133,6 +133,7 @@ class VideoStreamService {
       const onEnrollStep = (data) => sendJson('ENROLL_STEP', data);
       const onEnrollDone = (data) => sendJson('ENROLL_DONE', data);
       const onDeletedDone = (data) => sendJson('DELETED_DONE', data);
+      const onFacesSync = (data) => sendJson('FACES_SYNCED', data);
 
       mqttGateway.on('device_status', onStatus);
       mqttGateway.on('door_event', onDoor);
@@ -141,6 +142,7 @@ class VideoStreamService {
       mqttGateway.on('enroll_step', onEnrollStep);
       mqttGateway.on('enroll_done', onEnrollDone);
       mqttGateway.on('deleted_done', onDeletedDone);
+      mqttGateway.on('faces_sync', onFacesSync);
 
       ws.on('close', () => {
         mqttGateway.off('device_status', onStatus);
@@ -150,6 +152,7 @@ class VideoStreamService {
         mqttGateway.off('enroll_step', onEnrollStep);
         mqttGateway.off('enroll_done', onEnrollDone);
         mqttGateway.off('deleted_done', onDeletedDone);
+        mqttGateway.off('faces_sync', onFacesSync);
       });
     });
   }

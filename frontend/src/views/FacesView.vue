@@ -207,7 +207,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import api from '../api/client';
 import { useSystemStore } from '../stores/system';
 import { useNotifyStore } from '../stores/notify';
@@ -368,6 +368,10 @@ function formatExpiry(iso) {
 }
 
 onMounted(() => {
+  fetchFaces();
+});
+
+watch(() => system.facesSyncVersion, () => {
   fetchFaces();
 });
 </script>

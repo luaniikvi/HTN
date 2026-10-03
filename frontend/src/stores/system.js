@@ -20,7 +20,8 @@ export const useSystemStore = defineStore('system', {
     enrollStep: 0,
     enrollStepData: null,
     enrolledFaceId: null,
-    isEnrolling: false
+    isEnrolling: false,
+    facesSyncVersion: 0
   }),
 
   getters: {
@@ -37,7 +38,7 @@ export const useSystemStore = defineStore('system', {
           this.status = s.status;
           this.doorState = s.door_state;
           this.securityMode = s.security_mode;
-          this.forcedAlarm = (s.security_mode === 'DISARMED') ? false : Boolean(s.forced_alarm);
+          this.forcedAlarm = Boolean(s.forced_alarm);
           this.armedLatched = (s.security_mode === 'DISARMED') ? false : Boolean(s.armed_latched);
           this.gracePeriod = s.grace_period;
         }
@@ -104,11 +105,14 @@ export const useSystemStore = defineStore('system', {
 
           if (type === 'DEVICE_STATUS') {
             const prevMode = this.securityMode;
-            this.status = payload.status;
-            this.doorState = payload.doorState;
-            this.securityMode = payload.securityMode;
+            if (payload.status) this.status = payload.status;
+            if (payload.doorState) this.doorState = payload.doorState;
+            if (payload.securityMode) this.securityMode = payload.securityMode;
+            if (payload.gracePeriod) this.gracePeriod = payload.gracePeriod;
+            if (payload.alarm !== undefined) {
+              this.forcedAlarm = Boolean(payload.alarm);
+            }
             if (payload.securityMode === 'DISARMED') {
-              this.forcedAlarm = false;
               this.armedLatched = false;
               this.activeBreachAlert = null;
             } else if (prevMode !== payload.securityMode) {
@@ -152,6 +156,8 @@ export const useSystemStore = defineStore('system', {
               const reasonMsg = reasonMap[payload.reason] || payload.reason || 'Dang ky khong thanh cong.';
               notify.error(reasonMsg, 'Dang ky that bai');
             }
+          } else if (type === 'FACES_SYNCED') {
+            this.facesSyncVersion++;
           }
         } catch (err) {
           console.error('Error parsing event message:', err);

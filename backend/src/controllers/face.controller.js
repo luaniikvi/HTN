@@ -55,6 +55,15 @@ exports.bindFace = async (req, res) => {
       is_active: true
     });
 
+    // Đồng bộ metadata sang ESP32 để lưu Flash NVS
+    mqttGateway.sendUpdateFaceMetaCommand({
+      face_id: parseInt(face_id),
+      name,
+      role_type: role_type === 'TEMPORARY' ? 'TEMPORARY' : 'PERMANENT',
+      valid_until: role_type === 'TEMPORARY' && valid_until ? valid_until : '',
+      is_active: true
+    });
+
     res.status(201).json({
       success: true,
       message: 'Face assigned successfully',

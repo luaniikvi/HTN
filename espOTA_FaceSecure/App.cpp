@@ -93,6 +93,9 @@ char topic_cmd_alarm[64];
 char topic_cmd_stream[64];
 char topic_cmd_config[64];
 char topic_cmd_toggle_face[64];
+char topic_cmd_update_face_meta[64];
+char topic_event_config[64];
+char topic_event_faces[64];
 char breach_upload_url[128];
 
 // =================================================================================================
@@ -142,10 +145,30 @@ std::atomic<bool> captureBreachRequested{false}; // Yêu cầu Core 1 chụp ả
 std::atomic<bool> breachSnapshotTaken{false}; // Cờ chốt chống chụp lặp khi cửa đang mở
 
 unsigned long       authSuccessMillis = 0;
-std::atomic<unsigned long> gracePeriodMs{10000}; // Mặc định 10 giây (tùy chỉnh 5 - 15 giây từ xa qua Web)
+std::atomic<unsigned long> gracePeriodMs{10000}; // Mặc định 10 giây (tùy chỉnh 3 - 60 giây từ xa qua Web)
 
 // Quản lý Flash NVS
 const char* PREF_NAMESPACE = "face_nvs";
+const char* PREF_SYS_NAMESPACE = "sys_cfg";
+
+void saveGracePeriodToNVS(int sec) {
+  Preferences prefs;
+  if (prefs.begin(PREF_SYS_NAMESPACE, false)) {
+    prefs.putInt("grace_sec", sec);
+    prefs.end();
+  }
+}
+
+int loadGracePeriodFromNVS() {
+  Preferences prefs;
+  int sec = 10;
+  if (prefs.begin(PREF_SYS_NAMESPACE, true)) {
+    sec = prefs.getInt("grace_sec", 10);
+    prefs.end();
+  }
+  if (sec < 3 || sec > 60) sec = 10;
+  return sec;
+}
 
 // Client mạng
 WiFiClient espClient;
@@ -596,6 +619,97 @@ bool initCamera() {
   return true;
 }
 
+#include "FacePolicy.h"
+#include "FaceEngine.h"
+
+struct FaceMeta {
+  int32_t face_id;
+  char name[64];
+  char role_type[16];   // "PERMANENT" or "TEMPORARY"
+  char valid_until[32]; // ISO string or empty
+  bool is_active;
+};
+static FaceMeta sharedFaceMeta[FacePolicy::PEOPLE];
+static std::atomic<int> sharedFaceMetaCount{0};
+static std::atomic<bool> facesSyncPending{false};
+
+void saveFaceMetaToNVS() {
+  Preferences p;
+  if (p.begin("face_meta", false)) {
+    p.putBytes("meta", sharedFaceMeta, sizeof(sharedFaceMeta));
+    p.end();
+  }
+}
+
+void loadFaceMetaFromNVS() {
+  Preferences p;
+  memset(sharedFaceMeta, 0, sizeof(sharedFaceMeta));
+  if (p.begin("face_meta", true)) {
+    p.getBytes("meta", sharedFaceMeta, sizeof(sharedFaceMeta));
+    p.end();
+  }
+  int cnt = 0;
+  for (int i = 0; i < FacePolicy::PEOPLE; i++) {
+    if (sharedFaceMeta[i].face_id > 0) cnt++;
+  }
+  sharedFaceMetaCount.store(cnt);
+}
+
+void updateSharedEnrolledFaces(FaceEngine *engine) {
+  if (!engine || !engine->db) return;
+  uint32_t mask = FaceEngine::activeFacesMask.load();
+  if (xSemaphoreTake(sharedStateMutex, (TickType_t)20) == pdTRUE) {
+    int validCount = 0;
+    for (int i = 0; i < FacePolicy::PEOPLE; i++) {
+      int32_t pid = engine->db->people[i].id;
+      if (pid > 0) {
+        bool active = (pid > 31) || ((mask & (1UL << pid)) != 0);
+        int foundIdx = -1;
+        for (int m = 0; m < FacePolicy::PEOPLE; m++) {
+          if (sharedFaceMeta[m].face_id == pid) {
+            foundIdx = m;
+            break;
+          }
+        }
+        if (foundIdx >= 0) {
+          sharedFaceMeta[foundIdx].is_active = active;
+        } else {
+          for (int m = 0; m < FacePolicy::PEOPLE; m++) {
+            if (sharedFaceMeta[m].face_id == 0) {
+              sharedFaceMeta[m].face_id = pid;
+              snprintf(sharedFaceMeta[m].name, sizeof(sharedFaceMeta[m].name), "Person #%d", (int)pid);
+              strncpy(sharedFaceMeta[m].role_type, "PERMANENT", sizeof(sharedFaceMeta[m].role_type));
+              sharedFaceMeta[m].valid_until[0] = '\0';
+              sharedFaceMeta[m].is_active = active;
+              break;
+            }
+          }
+        }
+        validCount++;
+      }
+    }
+    // Dọn dẹp metadata của các face_id đã bị xóa khỏi engine
+    for (int m = 0; m < FacePolicy::PEOPLE; m++) {
+      if (sharedFaceMeta[m].face_id > 0) {
+        bool stillExists = false;
+        for (int i = 0; i < FacePolicy::PEOPLE; i++) {
+          if (engine->db->people[i].id == sharedFaceMeta[m].face_id) {
+            stillExists = true;
+            break;
+          }
+        }
+        if (!stillExists) {
+          memset(&sharedFaceMeta[m], 0, sizeof(FaceMeta));
+        }
+      }
+    }
+    sharedFaceMetaCount.store(validCount);
+    saveFaceMetaToNVS();
+    xSemaphoreGive(sharedStateMutex);
+  }
+  facesSyncPending = true;
+}
+
 #include "FaceRuntime.h"
 
 // =================================================================================================
@@ -610,9 +724,48 @@ void publishStatus() {
   else if (currentMode == MODE_STAY) doc["mode"] = "STAY";
   else doc["mode"] = "DISARMED";
 
+  doc["grace_period"] = (int)(gracePeriodMs.load() / 1000UL);
+  doc["alarm"] = (forcedAlarm.load() || (currentMode == MODE_ARMED && armedAlarmLatched.load()));
+
   char buf[192];
   serializeJson(doc, buf);
   mqttClient.publish(topic_status, buf, true); // Retained QoS 1
+}
+
+void sendGracePeriodSync() {
+  StaticJsonDocument<128> doc;
+  doc["grace_period"] = (int)(gracePeriodMs.load() / 1000UL);
+  char buf[128];
+  serializeJson(doc, buf);
+  mqttClient.publish(topic_event_config, buf);
+  Serial.printf("[MQTT] 📤 Đã gửi gói tin đồng bộ grace_period: %d giây\n", (int)(gracePeriodMs.load() / 1000UL));
+}
+
+void sendFacesSyncEvent() {
+  StaticJsonDocument<1024> doc;
+  JsonArray arr = doc.createNestedArray("faces");
+  if (xSemaphoreTake(sharedStateMutex, (TickType_t)20) == pdTRUE) {
+    for (int i = 0; i < FacePolicy::PEOPLE; i++) {
+      if (sharedFaceMeta[i].face_id > 0) {
+        JsonObject item = arr.createNestedObject();
+        item["face_id"] = sharedFaceMeta[i].face_id;
+        item["name"] = sharedFaceMeta[i].name;
+        item["role_type"] = sharedFaceMeta[i].role_type;
+        if (strlen(sharedFaceMeta[i].valid_until) > 0) {
+          item["valid_until"] = sharedFaceMeta[i].valid_until;
+        } else {
+          item["valid_until"] = nullptr;
+        }
+        item["is_active"] = sharedFaceMeta[i].is_active;
+      }
+    }
+    xSemaphoreGive(sharedStateMutex);
+  }
+  doc["count"] = arr.size();
+  char buf[1024];
+  serializeJson(doc, buf);
+  mqttClient.publish(topic_event_faces, buf, true); // Retained QoS 1
+  Serial.printf("[MQTT] 👥 Đã gửi gói tin đồng bộ %d khuôn mặt (đầy đủ metadata) lên Server\n", (int)arr.size());
 }
 
 void sendDoorEvent(bool open) {
@@ -635,12 +788,32 @@ void sendAlarmBreachEvent() {
 }
 
 void sendAuthEvent(int faceId) {
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<256> doc;
   doc["face_id"] = faceId;
   doc["status"]  = "SUCCESS";
-  char buf[128];
+  char faceName[64] = "";
+  if (xSemaphoreTake(sharedStateMutex, (TickType_t)20) == pdTRUE) {
+    for (int i = 0; i < FacePolicy::PEOPLE; i++) {
+      if (sharedFaceMeta[i].face_id == faceId) {
+        if (strlen(sharedFaceMeta[i].name) > 0) {
+          strncpy(faceName, sharedFaceMeta[i].name, sizeof(faceName) - 1);
+          faceName[sizeof(faceName) - 1] = '\0';
+          doc["name"] = faceName;
+        }
+        if (strlen(sharedFaceMeta[i].role_type) > 0) {
+          doc["role_type"] = sharedFaceMeta[i].role_type;
+        }
+        break;
+      }
+    }
+    xSemaphoreGive(sharedStateMutex);
+  }
+  char buf[256];
   serializeJson(doc, buf);
   mqttClient.publish(topic_event_auth, buf);
+  if (strlen(faceName) > 0) {
+    Serial.printf("[AUTH] 🔓 Đã gửi event xác thực: Face ID %d (%s)\n", faceId, faceName);
+  }
 }
 
 void sendEnrollStepEvent(int step, const char* angleName) {
@@ -737,6 +910,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       // Tắt trực tiếp còi qua Web khi đang hú BUZZER_ON
       armedAlarmLatched = false;
     }
+    publishStatus();
   }
   // Lệnh bật/tắt/điều tiết stream (Auto-Throttling khi viewers.length == 0 hoặc theo yêu cầu từ Web)
   else if (strcmp(topic, topic_cmd_stream) == 0) {
@@ -749,12 +923,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.printf("[MQTT] -> Nhận lệnh điều khiển Camera Stream: %s\n", en ? "BẬT (ON)" : "TẮT (OFF)");
     }
   }
-  // Lệnh cấu hình thời gian ân hạn mở cửa (5 - 15 giây)
+  // Lệnh cấu hình thời gian ân hạn mở cửa (3 - 60 giây)
   else if (strcmp(topic, topic_cmd_config) == 0) {
     if (doc.containsKey("grace_period")) {
       int sec = doc["grace_period"];
       if (sec >= 3 && sec <= 60) {
         gracePeriodMs = sec * 1000UL;
+        saveGracePeriodToNVS(sec);
+        Serial.printf("[CONFIG] ⏱️ Đồng bộ & lưu NVS thời gian ân hạn từ Server: %d giây\n", sec);
+        sendGracePeriodSync();
+        publishStatus();
       }
     }
   }
@@ -764,8 +942,61 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     bool active = doc.containsKey("active") ? (bool)doc["active"] : true;
     if (faceId > 0 && faceId <= 31) {
       FaceEngine::setFaceActive(faceId, active);
+      if (xSemaphoreTake(sharedStateMutex, (TickType_t)20) == pdTRUE) {
+        for (int i = 0; i < FacePolicy::PEOPLE; i++) {
+          if (sharedFaceMeta[i].face_id == faceId) {
+            sharedFaceMeta[i].is_active = active;
+            break;
+          }
+        }
+        saveFaceMetaToNVS();
+        xSemaphoreGive(sharedStateMutex);
+      }
+      facesSyncPending = true;
       Serial.printf("[FACE] Cập nhật person=%d active=%s (mask=0x%08X)\n",
                     faceId, active ? "BẬT" : "TẮT", FaceEngine::activeFacesMask.load());
+    }
+  }
+  // Lệnh cập nhật đầy đủ thông tin khuôn mặt (Name, Role, Expiration) để lưu NVS
+  else if (strcmp(topic, topic_cmd_update_face_meta) == 0) {
+    int faceId = doc["face_id"] | 0;
+    if (faceId > 0) {
+      const char* name = doc["name"] | "";
+      const char* role = doc["role_type"] | "PERMANENT";
+      const char* valid = doc["valid_until"] | "";
+      bool active = doc.containsKey("is_active") ? (bool)doc["is_active"] : true;
+
+      if (xSemaphoreTake(sharedStateMutex, (TickType_t)20) == pdTRUE) {
+        bool found = false;
+        for (int m = 0; m < FacePolicy::PEOPLE; m++) {
+          if (sharedFaceMeta[m].face_id == faceId) {
+            if (strlen(name) > 0) strncpy(sharedFaceMeta[m].name, name, sizeof(sharedFaceMeta[m].name) - 1);
+            strncpy(sharedFaceMeta[m].role_type, role, sizeof(sharedFaceMeta[m].role_type) - 1);
+            strncpy(sharedFaceMeta[m].valid_until, valid, sizeof(sharedFaceMeta[m].valid_until) - 1);
+            sharedFaceMeta[m].is_active = active;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          for (int m = 0; m < FacePolicy::PEOPLE; m++) {
+            if (sharedFaceMeta[m].face_id == 0) {
+              sharedFaceMeta[m].face_id = faceId;
+              if (strlen(name) > 0) strncpy(sharedFaceMeta[m].name, name, sizeof(sharedFaceMeta[m].name) - 1);
+              else snprintf(sharedFaceMeta[m].name, sizeof(sharedFaceMeta[m].name), "Person #%d", faceId);
+              strncpy(sharedFaceMeta[m].role_type, role, sizeof(sharedFaceMeta[m].role_type) - 1);
+              strncpy(sharedFaceMeta[m].valid_until, valid, sizeof(sharedFaceMeta[m].valid_until) - 1);
+              sharedFaceMeta[m].is_active = active;
+              break;
+            }
+          }
+        }
+        saveFaceMetaToNVS();
+        xSemaphoreGive(sharedStateMutex);
+      }
+      FaceEngine::setFaceActive(faceId, active);
+      facesSyncPending = true;
+      Serial.printf("[FACE] Cập nhật metadata NVS ID=%d: %s (%s)\n", faceId, name, role);
     }
   }
 }
@@ -784,7 +1015,6 @@ void tryReconnectMQTT() {
   Serial.printf("[MQTT] 🔄 Đang thử kết nối broker %s:%d (User: %s)...\n", serverIP, mqtt_port, mqtt_user);
   if (mqttClient.connect(DEVICE_ID, mqtt_user, mqtt_pass, topic_status, 1, true, lwtBuf)) {
     Serial.printf("✅ [MQTT] Đã kết nối Broker thành công! ClientID=%s (WiFi RSSI: %d dBm)\n", DEVICE_ID, WiFi.RSSI());
-    publishStatus();
     mqttClient.subscribe(topic_cmd_mode);
     mqttClient.subscribe(topic_cmd_enroll);
     mqttClient.subscribe(topic_cmd_delete);
@@ -792,6 +1022,14 @@ void tryReconnectMQTT() {
     mqttClient.subscribe(topic_cmd_stream);
     mqttClient.subscribe(topic_cmd_config);
     mqttClient.subscribe(topic_cmd_toggle_face);
+    mqttClient.subscribe(topic_cmd_update_face_meta);
+    publishStatus();
+    sendGracePeriodSync();
+    if (aiReady.load()) {
+      sendFacesSyncEvent();
+    } else {
+      facesSyncPending = true;
+    }
   } else {
     // Mã lỗi: -4: TIMEOUT, -3: LOST_CONN, -2: CONNECT_FAILED, 1: BAD_PROTO, 2: BAD_ID, 4: BAD_CREDENTIALS, 5: UNAUTHORIZED
     Serial.printf("❌ [MQTT] Kết nối thất bại, state = %d. WiFi RSSI: %d dBm (Kiểm tra IP/Port/User/Pass/Broker)\n",
@@ -907,6 +1145,17 @@ void setup() {
   snprintf(topic_cmd_stream, sizeof(topic_cmd_stream), "device/%s/cmd/stream", DEVICE_ID);
   snprintf(topic_cmd_config, sizeof(topic_cmd_config), "device/%s/cmd/config", DEVICE_ID);
   snprintf(topic_cmd_toggle_face, sizeof(topic_cmd_toggle_face), "device/%s/cmd/toggle_face", DEVICE_ID);
+  snprintf(topic_cmd_update_face_meta, sizeof(topic_cmd_update_face_meta), "device/%s/cmd/update_face_meta", DEVICE_ID);
+  snprintf(topic_event_config, sizeof(topic_event_config), "device/%s/events/config", DEVICE_ID);
+  snprintf(topic_event_faces, sizeof(topic_event_faces), "device/%s/events/faces", DEVICE_ID);
+
+  loadFaceMetaFromNVS();
+
+  // Đọc Grace Period từ Flash NVS
+  int savedGrace = loadGracePeriodFromNVS();
+  gracePeriodMs = savedGrace * 1000UL;
+  Serial.printf("[SYSTEM] 💾 Đã tải Grace Period từ NVS: %d giây\n", savedGrace);
+
   // Đọc chế độ an ninh khởi tạo từ công tắc vật lý
   currentMode = readSwitchModeWithDebounce();
 
@@ -1185,6 +1434,10 @@ void loop() {
     if (deleteDoneEventPending && mqttClient.connected()) {
       deleteDoneEventPending = false;
       sendDeletedDoneEvent(deleteDoneFaceId.load(), deleteDoneResult.load());
+    }
+    if (facesSyncPending && mqttClient.connected() && aiReady.load()) {
+      facesSyncPending = false;
+      sendFacesSyncEvent();
     }
 
     // ponytail: định kỳ 5s in nhịp tim chẩn đoán Wi-Fi & MQTT để phát hiện rớt sóng / mất broker

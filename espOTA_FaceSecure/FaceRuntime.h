@@ -96,6 +96,7 @@ static void inferenceTask(void *) {
     // Retain task to return explicit failures to web commands.
   } else {
     enrolledFaces=engine->count(); aiReady=true;
+    updateSharedEnrolledFaces(engine);
     Serial.printf("[FACE] READY: %d/10 people; real ESP-DL INT8 embeddings (ROTATION=%ddeg %dx%d)\n",
                   engine->count(), CAMERA_ROTATION, FacePolicy::IMG_W, FacePolicy::IMG_H);
   }
@@ -108,7 +109,10 @@ static void inferenceTask(void *) {
     int deleteId;
     if(xQueueReceive(deleteQueue,&deleteId,0)==pdTRUE) {
       bool deleted=ok && engine->erase(deleteId);
-      if(ok) enrolledFaces=engine->count();
+      if(ok) {
+        enrolledFaces=engine->count();
+        updateSharedEnrolledFaces(engine);
+      }
       xSemaphoreTake(sharedStateMutex,portMAX_DELAY);
       ++authEpoch; isAuthenticated=false;
       xSemaphoreGive(sharedStateMutex);
@@ -242,6 +246,7 @@ static void inferenceTask(void *) {
             }
             xSemaphoreGive(sharedStateMutex);
             enrolledFaces = engine->count();
+            if(id > 0) updateSharedEnrolledFaces(engine);
             completed = frameEpoch;
             if(id > 0) {
               Serial.println("\n[FACE] [ENROLL] ==================================================");

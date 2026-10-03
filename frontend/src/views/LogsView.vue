@@ -8,6 +8,30 @@
       </div>
 
       <div class="header-actions">
+        <!-- Download as CSV (Authorize, Access, Breach Incidents) -->
+        <button
+          v-if="activeTab !== 'gallery'"
+          class="btn btn-secondary"
+          @click="downloadCurrentTabCSV"
+          :disabled="isLoading || currentTabCount === 0"
+          title="Export current tab logs to CSV spreadsheet"
+        >
+          <Download :size="16" />
+          <span>Download as CSV</span>
+        </button>
+
+        <!-- Download all images (Evidence Gallery) -->
+        <button
+          v-else
+          class="btn btn-secondary"
+          @click="downloadAllImages"
+          :disabled="isLoading || isDownloadingImages || breachImages.length === 0"
+          title="Download all breach snapshots"
+        >
+          <Download :size="16" :class="{ spinning: isDownloadingImages }" />
+          <span>{{ isDownloadingImages ? `Downloading (${downloadProgress}/${breachImages.length})...` : 'Download all images' }}</span>
+        </button>
+
         <button class="btn btn-secondary" @click="fetchCurrentTabLogs" :disabled="isLoading">
           <RefreshCw :size="16" :class="{ spinning: isLoading }" />
           <span>Refresh</span>
@@ -363,6 +387,124 @@ function formatTime(iso) {
     second: '2-digit'
   });
 }
+
+// =================================================================================================
+// LOG EXPORT & EVIDENCE IMAGE DOWNLOAD FUNCTIONS
+// =================================================================================================
+const isDownloadingImages = ref(false);
+const downloadProgress = ref(0);
+
+const currentTabCount = computed(() => {
+  if (activeTab.value === 'authorize') return authLogs.value.length;
+  if (activeTab.value === 'access') return accessLogs.value.length;
+  if (activeTab.value === 'alarms') return alarmLogs.value.length;
+  if (activeTab.value === 'gallery') return breachImages.value.length;
+  return 0;
+});
+
+function getExportTimestamp() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function exportToCSV(filename, headers, rows) {
+  if (!rows || rows.length === 0) return;
+  const escapeCell = (val) => {
+    if (val === null || val === undefined) return '""';
+    const str = String(val).replace(/"/g, '""');
+    return `"${str}"`;
+  };
+
+  const headerLine = headers.map(escapeCell).join(',');
+  const rowLines = rows.map(row => row.map(escapeCell).join(','));
+  const csvContent = '\uFEFF' + [headerLine, ...rowLines].join('\r\n');
+
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.setAttribute('download', filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function downloadCurrentTabCSV() {
+  const ts = getExportTimestamp();
+  if (activeTab.value === 'authorize') {
+    const headers = ['Timestamp', 'Face ID', 'Subject Name', 'Access Tier', 'Result', 'Details'];
+    const rows = authLogs.value.map(log => [
+      log.timestamp ? new Date(log.timestamp).toLocaleString() : '',
+      log.face_id !== undefined && log.face_id !== null ? log.face_id : '',
+      log.face?.name || extractNameFromDetails(log.details) || (log.face_id ? `Face #${log.face_id}` : 'Unknown'),
+      log.face?.role_type || 'REGISTERED',
+      'VERIFIED',
+      log.details || ''
+    ]);
+    exportToCSV(`authorize_history_${ts}.csv`, headers, rows);
+  } else if (activeTab.value === 'access') {
+    const headers = ['Timestamp', 'Device ID', 'Event Type', 'Details'];
+    const rows = accessLogs.value.map(log => [
+      log.timestamp ? new Date(log.timestamp).toLocaleString() : '',
+      log.device_id || '',
+      log.event_type || '',
+      log.details || ''
+    ]);
+    exportToCSV(`access_history_${ts}.csv`, headers, rows);
+  } else if (activeTab.value === 'alarms') {
+    // Tải log và incident history (trừ ảnh)
+    const headers = ['Timestamp', 'Device ID', 'Security Mode', 'Trigger Event', 'Details'];
+    const rows = alarmLogs.value.map(log => [
+      log.timestamp ? new Date(log.timestamp).toLocaleString() : '',
+      log.device_id || '',
+      log.mode || '',
+      log.event || '',
+      log.details || ''
+    ]);
+    exportToCSV(`breach_incidents_${ts}.csv`, headers, rows);
+  }
+}
+
+async function downloadAllImages() {
+  if (isDownloadingImages.value || breachImages.value.length === 0) return;
+  isDownloadingImages.value = true;
+  downloadProgress.value = 0;
+  try {
+    for (let i = 0; i < breachImages.value.length; i++) {
+      const item = breachImages.value[i];
+      const d = item.timestamp ? new Date(item.timestamp) : new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const timeStr = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+      const filename = `breach_${item.device_id || 'dev'}_${timeStr}_${i + 1}.jpg`;
+
+      try {
+        const response = await fetch(item.image_url);
+        const blob = await response.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      } catch (err) {
+        console.error('Failed to download image:', item.image_url, err);
+      }
+
+      downloadProgress.value = i + 1;
+      if (i < breachImages.value.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+  } finally {
+    isDownloadingImages.value = false;
+    downloadProgress.value = 0;
+  }
+}
+
 
 watch(activeTab, (tab) => {
   if ((tab === 'access' || tab === 'authorize') && accessLogs.value.length === 0) fetchAccessLogs();

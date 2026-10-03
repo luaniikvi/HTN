@@ -16,8 +16,8 @@ exports.getSystemState = async (req, res) => {
         armed_latched: false,
         grace_period: 10
       });
-    } else if (state.security_mode === 'DISARMED' && (state.forced_alarm || state.armed_latched)) {
-      await state.update({ forced_alarm: false, armed_latched: false });
+    } else if (state.security_mode === 'DISARMED' && state.armed_latched) {
+      await state.update({ armed_latched: false });
     }
     res.json({ success: true, state });
   } catch (err) {
