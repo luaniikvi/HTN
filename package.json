@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "discovery": "node backend/src/services/discovery.service.js"
+  },
+  "dependencies": {
+    "morphicons": "^1.7.1"
+  }
+}
